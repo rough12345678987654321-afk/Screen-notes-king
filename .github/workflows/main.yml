@@ -1,29 +1,80 @@
 name: Build APK
+
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "ScreenNotes/**"
+      - ".github/workflows/main.yml"
+
+permissions:
+  contents: write # needed to publish the APK as a GitHub release
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Unzip project
-        run: unzip -q *.zip -d proj
-      - name: Apply fixes
-        run: |
-          sed -i 's|Card(Modifier.fillMaxWidth(), onClick = { onOpen(n.id) })|Card(onClick = { onOpen(n.id) }, modifier = Modifier.fillMaxWidth())|' proj/ScreenNotes/app/src/main/java/com/example/screennotes/MainActivity.kt
-          sed -i 's|gemini-2.5-flash|gemini-3.8-flash|' proj/ScreenNotes/app/src/main/java/com/example/screennotes/Gemini.kt
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
+
       - uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: 8.9
+          gradle-version: "8.9"
+
       - name: Build debug APK
-        working-directory: proj/ScreenNotes
-        run: gradle assembleDebug
+        working-directory: ScreenNotes
+        env:
+          # Baked into the app so its Updates tab knows exactly which build is installed.
+          APP_GIT_SHA: ${{ github.sha }}
+          APP_BUILD_LABEL: ${{ github.ref_name }}
+        run: |
+          APP_BUILD_TIME="$(date +%s)000"
+          export APP_BUILD_TIME
+          gradle assembleDebug --console=plain
+
       - uses: actions/upload-artifact@v4
         with:
           name: ScreenNotes-apk
-          path: proj/ScreenNotes/app/build/outputs/apk/debug/app-debug.apk
+          path: ScreenNotes/app/build/outputs/apk/debug/app-debug.apk
+
+      # Builds of main are also published as the "Latest" GitHub release. The app's Updates tab
+      # offers it as "New version available", and anyone can download it from the Releases page
+      # without logging in or unzipping anything.
+      - name: Publish as latest release
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          set -euo pipefail
+          cp ScreenNotes/app/build/outputs/apk/debug/app-debug.apk ScreenNotes.apk
+          TAG="build-${GITHUB_RUN_NUMBER}"
+          gh release delete "$TAG" --cleanup-tag --yes >/dev/null 2>&1 || true
+          {
+            echo "Automatic build of \`main\`."
+            echo
+            if [ -n "${COMMIT_MSG:-}" ]; then echo "**Latest change:** ${COMMIT_MSG%%$'\n'*}"; echo; fi
+            echo "Commit: ${GITHUB_SHA}"
+            echo
+            echo "Install: download **ScreenNotes.apk** below on your phone/tablet and open it,"
+            echo "or tap **Install** in the app's Updates tab."
+          } > notes.md
+          gh release create "$TAG" ScreenNotes.apk \
+            --target "$GITHUB_SHA" \
+            --title "Screen Notes (build ${GITHUB_RUN_NUMBER})" \
+            --notes-file notes.md \
+            --latest
+          # Keep only the 3 newest main builds (test builds from AI updates are separate pre-releases).
+          gh release list --limit 100 --json tagName,isPrerelease \
+            --jq '.[] | select(.isPrerelease | not) | .tagName' \
+            | grep -E '^build-[0-9]+$' | sort -t- -k2 -n -r | tail -n +4 \
+            | while read -r old; do gh release delete "$old" --cleanup-tag --yes || true; done
