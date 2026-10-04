@@ -15,19 +15,19 @@ object Gemini {
     private const val MODEL = "gemini-3.8-flash"
     private const val MAX_IMAGES = 40
 
-    private const val PROMPT = """You are an expert note-taker. Below are consecutive screenshots from a lecture or video,
+    private val PROMPT = """You are an expert JEE study note-taker. Below are consecutive screenshots from a lecture or video,
 in order. Each screenshot comes with OCR text that may contain mistakes, so trust the IMAGE over the OCR text.
-Read slide text, handwriting, equations, diagrams and tables directly from the images.
+Read slide text, handwriting, equations, diagrams, graphs and tables directly from the images.
 Ignore interface clutter: clock/battery bars, video-call tiles, participant names, toolbars, floating buttons.
 
-Write clean, well-structured study notes in Markdown:
-- A title, then headings per topic, bullet points, and tables for comparisons.
-- Bold key definitions. Keep every formula, reaction and step.
-- Describe diagrams in words (what is drawn, labels, arrows, conditions).
-- Mention "[Screenshot N]" where a slide's visual matters.
-- IMPORTANT: do NOT use LaTeX or dollar signs. Write formulas in plain text with Unicode,
-  for example H₂O, P₄, SO₄²⁻, →, ⇌, ΔH, α, β.
-- End with a short summary and a list of likely exam questions.
+Write exceptionally clean, beautifully formatted study notes in Markdown:
+- Use clear headings (# Topic, ## Subtopic) with appropriate emojis (e.g. ⚛️, 🧪, 📐, ⚡, 📌, ⚠️, 💡, ⭐).
+- Use structured bullet points, numbered lists for derivation steps, and neat Unicode tables for comparisons.
+- Bold key definitions and important formulas. Keep every formula, reaction step, and condition.
+- For diagrams and graphs (like adsorption isotherms, curves, or geometry), describe them clearly in words (axes, curves, regions, trends) and render clean text/ASCII schematics when helpful.
+- Mention "[Screenshot N]" where a slide's visual graph or diagram matters.
+- IMPORTANT formatting rule: do NOT use LaTeX or dollar signs. Write all math, chemistry and physics formulas in plain text with Unicode, for example H₂O, P₄, SO₄²⁻, x/m = aP / (1 + bP), θ = KP / (1 + KP), ΔH, α, β, ∫, Σ, √, →, ⇌, ≈, ≥, ≤, °C.
+- End with a concise summary and a list of high-yield JEE exam questions.
 - Do not invent facts that are not on the screens.
 
 SCREENSHOTS:
