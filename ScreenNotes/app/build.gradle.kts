@@ -5,6 +5,11 @@ plugins {
     id("com.google.devtools.ksp")
 }
 
+// Build info baked into the app (GitHub Actions fills it in) so the Updates tab knows which version
+// is installed. Local builds just show "local".
+fun buildEnv(name: String, default: String = ""): String =
+    System.getenv(name)?.takeIf { it.isNotBlank() }?.replace("\\", "")?.replace("\"", "") ?: default
+
 android {
     namespace = "com.example.screennotes"
     compileSdk = 34
@@ -14,7 +19,16 @@ android {
         minSdk = 26
         targetSdk = 34
         versionCode = 1
-        versionName = "0.1"
+        versionName = "0.2"
+
+        buildConfigField("String", "GIT_SHA", "\"${buildEnv("APP_GIT_SHA")}\"")
+        buildConfigField("String", "BUILD_LABEL", "\"${buildEnv("APP_BUILD_LABEL", "local")}\"")
+        buildConfigField("long", "BUILD_TIME", "${buildEnv("APP_BUILD_TIME", "0").toLongOrNull() ?: 0}L")
+        // The GitHub repository the Updates tab talks to (can be changed in the app).
+        buildConfigField(
+            "String", "DEFAULT_REPO",
+            "\"${buildEnv("GITHUB_REPOSITORY", "rough12345678987654321-afk/Screen-notes-king")}\""
+        )
     }
     signingConfigs {
         getByName("debug") {
@@ -24,7 +38,10 @@ android {
             keyPassword = "android"
         }
     }
-    buildFeatures { compose = true }
+    buildFeatures {
+        compose = true
+        buildConfig = true
+    }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -50,4 +67,9 @@ dependencies {
 
     // Show saved screenshots
     implementation("io.coil-kt:coil-compose:2.7.0")
+
+    // Updates tab: icons, lifecycle-aware refresh, and background checks for AI progress (notifications)
+    implementation("androidx.compose.material:material-icons-core")
+    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.3")
+    implementation("androidx.work:work-runtime-ktx:2.9.1")
 }
