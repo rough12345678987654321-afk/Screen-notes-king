@@ -173,6 +173,27 @@ fun Detail(id: Long, onBack: () -> Unit) {
     var text by remember(note?.id) { mutableStateOf(note?.aiNotes ?: "") }
     var busy by remember { mutableStateOf(false) }
 
+    // Auto-generate AI notes when opening the page if aiNotes is empty and shots are available
+    LaunchedEffect(note?.id, shots.size) {
+        if (note != null && note!!.aiNotes.isBlank() && shots.isNotEmpty() && !busy) {
+            val key = prefs.getString("key", "") ?: ""
+            if (key.isNotBlank()) {
+                busy = true
+                val generated = withContext(Dispatchers.IO) {
+                    try {
+                        val slideList = shots.map { s ->
+                            Slide(s.ocrText, runCatching { File(s.path).readBytes() }.getOrNull())
+                        }
+                        Gemini.makeNotes(key, slideList)
+                    } catch (e: Exception) { "Error: ${e.message}" }
+                }
+                text = generated
+                busy = false
+                dao.updateNote(note!!.copy(aiNotes = generated))
+            }
+        }
+    }
+
     LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
