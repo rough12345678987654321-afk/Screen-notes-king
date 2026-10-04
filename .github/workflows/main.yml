@@ -9,6 +9,9 @@ jobs:
       - uses: actions/checkout@v4
       - name: Unzip project
         run: unzip -q *.zip -d proj
+      - name: Fix card bug
+        run: |
+          sed -i 's|Card(Modifier.fillMaxWidth(), onClick = { onOpen(n.id) })|Card(onClick = { onOpen(n.id) }, modifier = Modifier.fillMaxWidth())|' proj/ScreenNotes/app/src/main/java/com/example/screennotes/MainActivity.kt
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
