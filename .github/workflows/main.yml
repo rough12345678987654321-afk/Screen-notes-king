@@ -23,7 +23,9 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Pinned (not ubuntu-latest) so the build machine never changes under us: the AI can't
+    # edit workflows, so a surprise OS upgrade could stop all builds.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
 
