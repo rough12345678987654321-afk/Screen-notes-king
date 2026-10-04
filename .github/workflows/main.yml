@@ -56,10 +56,13 @@ jobs:
         run: python3 .github/scripts/gradle_errors.py "$RUNNER_TEMP/gradle.log"
 
       # The APK itself (not zipped): download it from the run page and open it on your device.
+      # Kept for 7 days only: private repos get just 500 MB of artifact storage for free
+      # (the APKs on the Releases page don't count towards that).
       - uses: actions/upload-artifact@v7
         with:
           path: ScreenNotes.apk
           archive: false
+          retention-days: 7
 
       # Builds of main are also published as the "Latest" GitHub release. The app's Updates tab
       # offers it as "New version available", and anyone can download it from the Releases page

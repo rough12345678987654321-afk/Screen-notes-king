@@ -94,7 +94,7 @@ class GitHub(private val token: String, val repo: String) {
     private fun arr(path: String, cache: Boolean = false) = JSONArray(call("GET", path, null, cache))
 
     // ------------------------------------------------------------------ repository / user
-    fun repoInfo(): JSONObject = obj("GET", "/repos/$repo")
+    fun repoInfo(): JSONObject = obj("GET", "/repos/$repo", cache = true)
 
     fun login(): String = obj("GET", "/user").optString("login")
 
@@ -278,15 +278,21 @@ class GitHub(private val token: String, val repo: String) {
         }
     }
 
-    /** Converts an uploaded-screenshot link to a direct link + whether it needs our token. */
-    fun imageUrl(link: String): Pair<String, Boolean> {
-        val m = Regex("""https://github\.com/([^/]+/[^/]+)/(?:blob|raw)/([^/]+)/([^?#]+)""").find(link)
-        if (m != null && m.groupValues[1].equals(repo, ignoreCase = true)) {
-            val (_, ref, path) = m.destructured
-            return "https://raw.githubusercontent.com/$repo/$ref/$path" to true
-        }
-        return link to false
+    /**
+     * For a screenshot uploaded from the app: the API link that returns the image bytes (works for
+     * private repositories too, with [imageHeaders]). Null for pictures stored elsewhere.
+     */
+    fun imageApiUrl(link: String): String? {
+        val m = Regex("""https://github\.com/([^/]+/[^/]+)/(?:blob|raw)/([^/]+)/([^?#]+)""").find(link) ?: return null
+        if (!m.groupValues[1].equals(repo, ignoreCase = true)) return null
+        val (_, ref, path) = m.destructured
+        return "$API/repos/$repo/contents/$path?ref=${enc(ref)}"
     }
 
-    val authHeader get() = "Bearer $token"
+    val imageHeaders: Map<String, String>
+        get() = mapOf(
+            "Authorization" to "Bearer $token",
+            "Accept" to "application/vnd.github.raw",
+            "X-GitHub-Api-Version" to "2022-11-28",
+        )
 }

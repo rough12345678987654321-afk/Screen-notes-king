@@ -121,6 +121,7 @@ private fun UpdatesHome(onNew: () -> Unit, onOpen: (Int) -> Unit) {
     var error by remember { mutableStateOf<String?>(null) }
     var loading by remember { mutableStateOf(false) }
     var refreshKey by remember { mutableIntStateOf(0) }
+    var repoPrivate by remember { mutableStateOf(settings.repoPrivate) }
     val lifecycle = LocalLifecycleOwner.current.lifecycle
 
     if (connected) {
@@ -129,6 +130,8 @@ private fun UpdatesHome(onNew: () -> Unit, onOpen: (Int) -> Unit) {
                 while (true) {
                     loading = true
                     try {
+                        runCatching { UpdateRepo.refreshRepo(ctx) }
+                        repoPrivate = settings.repoPrivate
                         requests = UpdateRepo.list(ctx)
                         latest = try { UpdateRepo.latest(ctx) } catch (e: GitHubException) { latest }
                         error = null
@@ -194,7 +197,7 @@ private fun UpdatesHome(onNew: () -> Unit, onOpen: (Int) -> Unit) {
             }
             if (requests.isNotEmpty()) item { Text("Your requests", style = MaterialTheme.typography.titleMedium) }
             items(requests, key = { it.number }) { r -> RequestRow(r) { onOpen(r.number) } }
-            item { SetupHelpCard(settings) }
+            item { SetupHelpCard(settings, repoPrivate) }
         }
     }
 }
@@ -372,33 +375,52 @@ private fun NotificationsOffCard() {
 }
 
 @Composable
-private fun SetupHelpCard(settings: UpdateSettings) {
+private fun SetupHelpCard(settings: UpdateSettings, repoPrivate: Boolean) {
     val ctx = LocalContext.current
     val uri = LocalUriHandler.current
-    var open by rememberSaveable { mutableStateOf(false) }
+    var open by rememberSaveable { mutableStateOf(!repoPrivate) }
     val repo = settings.repo
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Row(Modifier.fillMaxWidth().clickable { open = !open }, verticalAlignment = Alignment.CenterVertically) {
-                Text("Finish setup on GitHub", style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
+                Text(
+                    if (repoPrivate) "Setup on GitHub" else "Finish setup on GitHub",
+                    style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f),
+                )
                 Icon(if (open) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown, contentDescription = null)
             }
             if (open) {
-                Text("1. Give the AI your Gemini key (once)", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+                if (!repoPrivate) {
+                    SetupStep("🔒 Make your repository private")
+                    Text(
+                        "Right now anyone on the internet can see your app's code and the requests and screenshots you " +
+                            "send. Since this app is just for you: open the settings, scroll down to \"Danger Zone\", tap " +
+                            "\"Change visibility\" → \"Make private\" and confirm. Everything keeps working.",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    OutlinedButton(onClick = { uri.openUri("https://github.com/$repo/settings") }) { Text("Open repository settings") }
+                }
+                SetupStep("🔑 Give the AI its own Gemini key")
                 Text(
-                    "Copy your key, open GitHub, type GEMINI_API_KEY as the Name, paste the key as the Secret, and tap \"Add secret\".",
+                    "Use a second free key just for app updates, so they never use up the daily quota you need for " +
+                        "your study notes. In AI Studio tap \"Create API key\", choose to create it in a NEW project, " +
+                        "and copy it. Then on GitHub type GEMINI_API_KEY as the Name, paste the key as the Secret and " +
+                        "tap \"Add secret\".",
                     style = MaterialTheme.typography.bodySmall,
                 )
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedButton(onClick = {
-                        val ok = UpdateRepo.copyGeminiKey(ctx)
-                        Toast.makeText(
-                            ctx, if (ok) "Gemini key copied" else "Paste your Gemini key on the Notes tab first", Toast.LENGTH_SHORT
-                        ).show()
-                    }) { Text("Copy my Gemini key") }
-                    OutlinedButton(onClick = { uri.openUri("https://github.com/$repo/settings/secrets/actions/new") }) { Text("Open GitHub") }
+                    OutlinedButton(onClick = { uri.openUri("https://aistudio.google.com/apikey") }) { Text("1. AI Studio") }
+                    OutlinedButton(onClick = { uri.openUri("https://github.com/$repo/settings/secrets/actions/new") }) { Text("2. GitHub secret") }
                 }
-                Text("2. Optional: let the AI open pull requests", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+                TextButton(onClick = {
+                    val ok = UpdateRepo.copyGeminiKey(ctx)
+                    Toast.makeText(
+                        ctx,
+                        if (ok) "Copied your notes key (it will share the notes quota)" else "No key saved on the Notes tab yet",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }, contentPadding = PaddingValues(0.dp)) { Text("Or copy the key from the Notes tab", style = MaterialTheme.typography.labelMedium) }
+                SetupStep("🔀 Optional: let the AI open pull requests")
                 Text(
                     "Under Workflow permissions tick \"Allow GitHub Actions to create and approve pull requests\" and Save. " +
                         "If you skip this, the app creates the pull request itself when you tap Approve.",
@@ -406,13 +428,18 @@ private fun SetupHelpCard(settings: UpdateSettings) {
                 )
                 OutlinedButton(onClick = { uri.openUri("https://github.com/$repo/settings/actions") }) { Text("Open Actions settings") }
                 Text(
-                    "Free Gemini keys only allow a few AI runs per day. If you hit the limit, turn on billing for the key " +
-                        "in Google AI Studio (a typical update costs well under one US dollar).",
+                    "Free Gemini keys allow only a few AI runs per day. If you hit the limit, try again the next day " +
+                        "(or turn on billing for that key; a typical update costs well under one US dollar).",
                     style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
         }
     }
+}
+
+@Composable
+private fun SetupStep(title: String) {
+    Text(title, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
 }
 
 // ============================================================================ new request
@@ -682,10 +709,11 @@ private fun RemoteImage(settings: UpdateSettings, link: String, modifier: Modifi
     val ctx = LocalContext.current
     val request = remember(link) {
         val gh = settings.client()
-        val (url, sameRepo) = gh?.imageUrl(link) ?: (link to false)
-        ImageRequest.Builder(ctx).data(url).crossfade(true).apply {
-            // Private repositories need the token to show screenshots.
-            if (sameRepo && settings.repoPrivate) addHeader("Authorization", "token ${settings.token}")
+        val apiUrl = gh?.imageApiUrl(link)
+        ImageRequest.Builder(ctx).data(apiUrl ?: link).crossfade(true).apply {
+            // Screenshots sent from the app are read through the GitHub API with your token,
+            // so they show up even when the repository is private.
+            if (apiUrl != null && gh != null) gh.imageHeaders.forEach { (k, v) -> addHeader(k, v) }
         }.build()
     }
     AsyncImage(model = request, contentDescription = "Screenshot", contentScale = ContentScale.Fit, modifier = modifier)

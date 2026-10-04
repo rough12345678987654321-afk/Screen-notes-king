@@ -191,6 +191,15 @@ object UpdateRepo {
         client(ctx).listRequests().also { listCache = it }
     }
 
+    /** Re-reads repository settings (e.g. after you make it private). Cheap: cached with ETags. */
+    suspend fun refreshRepo(ctx: Context) = withContext(Dispatchers.IO) {
+        val info = client(ctx).repoInfo()
+        UpdateSettings(ctx).apply {
+            repoPrivate = info.optBoolean("private", repoPrivate)
+            defaultBranch = info.optString("default_branch", defaultBranch)
+        }
+    }
+
     suspend fun detail(ctx: Context, n: Int): Pair<UpdateRequest, List<Message>> = withContext(Dispatchers.IO) {
         val gh = client(ctx)
         val req = gh.issue(n)
