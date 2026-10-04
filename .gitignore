@@ -1,0 +1,14 @@
+# Android / Gradle build output
+.gradle/
+build/
+local.properties
+*.iml
+.idea/
+.kotlin/
+captures/
+*.apk
+*.aab
+
+# Scratch space used by the AI updater workflow (never committed)
+.ai/
+__pycache__/

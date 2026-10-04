@@ -1,0 +1,89 @@
+# AI app updates: requests sent from the Screen Notes app's Updates tab arrive here as issues
+# labelled "app-update". Gemini changes the code, the app is compiled, and a test APK + pull request
+# are published. Progress is shown live in a status comment that the app displays.
+#
+# Setup: add your Gemini API key as a repository secret named GEMINI_API_KEY.
+# Optional: repository variables GEMINI_MODEL / GEMINI_FALLBACK_MODEL to pick other models.
+name: AI app update
+
+on:
+  issues:
+    types: [opened]
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: Number of the update request (issue) to work on
+        required: true
+
+permissions:
+  contents: write # push the ai/update-<n> branch and publish test APKs
+  issues: write # status comment and labels
+  pull-requests: write # open the pull request
+
+concurrency:
+  group: ai-update-${{ github.event.issue.number || inputs.issue }}
+  cancel-in-progress: false
+
+jobs:
+  update:
+    # Only the repo owner and collaborators can start the AI (the repo is public).
+    if: >-
+      github.event_name == 'workflow_dispatch' || (
+        contains(github.event.issue.labels.*.name, 'app-update') &&
+        github.event.issue.state == 'open' &&
+        !github.event.issue.pull_request && (
+          (github.event_name == 'issues' &&
+            contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association)) ||
+          (github.event_name == 'issue_comment' &&
+            contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
+            !endsWith(github.event.comment.user.login, '[bot]') &&
+            !contains(github.event.comment.body, '<!-- sn-bot') &&
+            !contains(github.event.comment.body, '<!-- sn:no-ai -->'))
+        )
+      )
+    # Pinned (not ubuntu-latest) so the build machine never changes under us: the AI can't
+    # edit workflows, so a surprise OS upgrade could stop all builds.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+      ISSUE_NUMBER: ${{ github.event.issue.number || inputs.issue }}
+      TRIGGER_USER: ${{ github.event.comment.user.login || github.event.issue.user.login || github.actor }}
+      GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-3.8-flash' }}
+      GEMINI_FALLBACK_MODEL: ${{ vars.GEMINI_FALLBACK_MODEL || 'gemini-3.5-flash-lite' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Start (status comment, screenshots, work branch)
+        id: start
+        run: python3 .github/scripts/app_update.py start
+
+      - uses: actions/setup-java@v6
+        if: steps.start.outputs.run_ai == 'true'
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v5
+        if: steps.start.outputs.run_ai == 'true'
+        with:
+          gradle-version: "8.9"
+
+      - name: AI makes the change
+        if: steps.start.outputs.run_ai == 'true'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python3 .github/scripts/app_update.py agent
+
+      - name: Publish test version
+        if: steps.start.outputs.run_ai == 'true'
+        run: python3 .github/scripts/app_update.py publish
+
+      - name: Report failure
+        if: (failure() || cancelled()) && steps.start.outputs.run_ai != 'false'
+        run: python3 .github/scripts/app_update.py fail

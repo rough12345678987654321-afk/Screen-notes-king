@@ -1,0 +1,227 @@
+package com.example.screennotes
+
+import android.Manifest
+import android.app.Activity
+import android.content.Context
+import android.content.Intent
+import android.media.projection.MediaProjectionManager
+import android.os.Build
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Build
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
+import coil.compose.AsyncImage
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.File
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        if (Build.VERSION.SDK_INT >= 33) {
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+        }
+        openFromNotification(intent)
+        UpdatePoller.start(this) // keeps an eye on running AI updates (only if GitHub is connected)
+        setContent { MaterialTheme { App() } }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        openFromNotification(intent)
+    }
+
+    /** A tap on an update notification opens that request in the Updates tab. */
+    private fun openFromNotification(i: Intent?) {
+        val n = i?.getIntExtra(UpdateNotifier.EXTRA_ISSUE, 0) ?: 0
+        if (n > 0) {
+            AppNav.openUpdate.value = n
+            i?.removeExtra(UpdateNotifier.EXTRA_ISSUE)
+        }
+    }
+}
+
+/** Lets notifications open a specific update request. */
+object AppNav {
+    val openUpdate = MutableStateFlow<Int?>(null)
+}
+
+@Composable
+fun App() {
+    var tab by rememberSaveable { mutableIntStateOf(0) }
+    var openId by remember { mutableStateOf<Long?>(null) }
+    var openRequest by rememberSaveable { mutableStateOf<Int?>(null) }
+    val pending by AppNav.openUpdate.collectAsState()
+    LaunchedEffect(pending) {
+        pending?.let {
+            tab = 1
+            openRequest = it
+            AppNav.openUpdate.value = null
+        }
+    }
+    BackHandler(enabled = tab == 0 && openId != null) { openId = null }
+    BackHandler(enabled = tab == 1 && openRequest == null) { tab = 0 }
+
+    Scaffold(
+        bottomBar = {
+            NavigationBar {
+                NavigationBarItem(
+                    selected = tab == 0, onClick = { tab = 0 },
+                    icon = { Icon(Icons.Default.Edit, contentDescription = null) }, label = { Text("Notes") },
+                )
+                NavigationBarItem(
+                    selected = tab == 1, onClick = { tab = 1 },
+                    icon = { Icon(Icons.Default.Build, contentDescription = null) }, label = { Text("Updates") },
+                )
+            }
+        }
+    ) { inner ->
+        Box(Modifier.padding(inner).statusBarsPadding().padding(16.dp)) {
+            if (tab == 0) {
+                val id = openId
+                if (id == null) Home { openId = it } else Detail(id) { openId = null }
+            } else {
+                UpdatesTab(openRequest) { openRequest = it }
+            }
+        }
+    }
+}
+
+@Composable
+fun Home(onOpen: (Long) -> Unit) {
+    val ctx = LocalContext.current
+    val dao = remember { AppDb.get(ctx).dao() }
+    val notes by dao.notes().collectAsState(initial = emptyList())
+    val running by CaptureService.running.collectAsState()
+    val scope = rememberCoroutineScope()
+    val prefs = remember { ctx.getSharedPreferences("p", Context.MODE_PRIVATE) }
+    var key by remember { mutableStateOf(prefs.getString("key", "") ?: "") }
+
+    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
+        if (r.resultCode == Activity.RESULT_OK && r.data != null) {
+            ctx.startForegroundService(
+                Intent(ctx, CaptureService::class.java).putExtra("code", r.resultCode).putExtra("data", r.data)
+            )
+        }
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Text("Screen Notes", style = MaterialTheme.typography.headlineMedium)
+        if (running) {
+            Button(onClick = {
+                ctx.startService(Intent(ctx, CaptureService::class.java).setAction(CaptureService.ACTION_STOP))
+            }) { Text("Stop capturing") }
+            Text("Capturing... switch to your lecture or video now.")
+        } else {
+            Button(onClick = {
+                val mpm = ctx.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                launcher.launch(mpm.createScreenCaptureIntent())
+            }) { Text("Start capturing") }
+        }
+        OutlinedTextField(
+            value = key,
+            onValueChange = { key = it; prefs.edit().putString("key", it).apply() },
+            label = { Text("Gemini API key (free, from aistudio.google.com/apikey)") },
+            modifier = Modifier.fillMaxWidth(), singleLine = true
+        )
+        Text("History", style = MaterialTheme.typography.titleMedium)
+        LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            items(notes) { n ->
+                Card(onClick = { onOpen(n.id) }, modifier = Modifier.fillMaxWidth()) {
+                    Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text(n.title, Modifier.weight(1f))
+                        TextButton(onClick = { scope.launch { deleteNote(ctx, n.id) } }) { Text("Delete") }
+                    }
+                }
+            }
+        }
+    }
+}
+
+suspend fun deleteNote(ctx: Context, id: Long) = withContext(Dispatchers.IO) {
+    val dao = AppDb.get(ctx).dao()
+    File(ctx.filesDir, "shots/$id").deleteRecursively()
+    dao.deleteShots(id)
+    dao.deleteNote(id)
+}
+
+@Composable
+fun Detail(id: Long, onBack: () -> Unit) {
+    val ctx = LocalContext.current
+    val dao = remember { AppDb.get(ctx).dao() }
+    val note by dao.note(id).collectAsState(initial = null)
+    val shots by dao.shots(id).collectAsState(initial = emptyList())
+    val scope = rememberCoroutineScope()
+    val prefs = remember { ctx.getSharedPreferences("p", Context.MODE_PRIVATE) }
+    var text by remember(note?.id) { mutableStateOf(note?.aiNotes ?: "") }
+    var busy by remember { mutableStateOf(false) }
+
+    LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        item {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = onBack) { Text("Back") }
+                Button(enabled = !busy && shots.isNotEmpty(), onClick = {
+                    val key = prefs.getString("key", "") ?: ""
+                    if (key.isBlank()) { text = "Paste your Gemini API key on the home screen first."; return@Button }
+                    busy = true
+                    scope.launch {
+                        text = withContext(Dispatchers.IO) {
+                            try {
+                                val slides = shots.map { s ->
+                                    Slide(s.ocrText, runCatching { File(s.path).readBytes() }.getOrNull())
+                                }
+                                Gemini.makeNotes(key, slides)
+                            } catch (e: Exception) { "Error: ${e.message}" }
+                        }
+                        busy = false
+                    }
+                }) { Text(if (busy) "Writing..." else "Make AI notes") }
+            }
+        }
+        item {
+            OutlinedTextField(
+                value = text, onValueChange = { text = it },
+                label = { Text("Your notes (editable)") },
+                modifier = Modifier.fillMaxWidth().heightIn(min = 200.dp)
+            )
+        }
+        item {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = { note?.let { n -> scope.launch { dao.updateNote(n.copy(aiNotes = text)) } } }) { Text("Save") }
+                OutlinedButton(onClick = {
+                    val send = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, text)
+                    ctx.startActivity(Intent.createChooser(send, "Share notes"))
+                }) { Text("Share / Export") }
+            }
+        }
+        item { Text("Captured screens (${shots.size})", style = MaterialTheme.typography.titleMedium) }
+        items(shots) { s ->
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    AsyncImage(model = File(s.path), contentDescription = null, modifier = Modifier.fillMaxWidth())
+                    if (s.ocrText.isNotBlank()) Text(s.ocrText, style = MaterialTheme.typography.bodySmall)
+                    TextButton(onClick = {
+                        scope.launch(Dispatchers.IO) { File(s.path).delete(); dao.deleteShot(s) }
+                    }) { Text("Delete this screenshot") }
+                }
+            }
+        }
+    }
+}
