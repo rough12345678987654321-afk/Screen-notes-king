@@ -172,10 +172,32 @@ fun Detail(id: Long, onBack: () -> Unit) {
     val prefs = remember { ctx.getSharedPreferences("p", Context.MODE_PRIVATE) }
     var text by remember(note?.id) { mutableStateOf(note?.aiNotes ?: "") }
     var busy by remember { mutableStateOf(false) }
+    var previewMode by remember { mutableStateOf(true) }
+
+    // Auto-generate AI notes when opening the page if aiNotes is empty and shots are available
+    LaunchedEffect(note?.id, shots.size) {
+        if (note != null && note!!.aiNotes.isBlank() && shots.isNotEmpty() && !busy) {
+            val key = prefs.getString("key", "") ?: ""
+            if (key.isNotBlank()) {
+                busy = true
+                val generated = withContext(Dispatchers.IO) {
+                    try {
+                        val slideList = shots.map { s ->
+                            Slide(s.ocrText, runCatching { File(s.path).readBytes() }.getOrNull())
+                        }
+                        Gemini.makeNotes(key, slideList)
+                    } catch (e: Exception) { "Error: ${e.message}" }
+                }
+                text = generated
+                busy = false
+                dao.updateNote(note!!.copy(aiNotes = generated))
+            }
+        }
+    }
 
     LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item {
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                 OutlinedButton(onClick = onBack) { Text("Back") }
                 Button(enabled = !busy && shots.isNotEmpty(), onClick = {
                     val key = prefs.getString("key", "") ?: ""
@@ -193,14 +215,32 @@ fun Detail(id: Long, onBack: () -> Unit) {
                         busy = false
                     }
                 }) { Text(if (busy) "Writing..." else "Make AI notes") }
+                Spacer(Modifier.weight(1f))
+                OutlinedButton(onClick = { previewMode = !previewMode }) {
+                    Text(if (previewMode) "Edit notes" else "Preview notes")
+                }
             }
         }
         item {
-            OutlinedTextField(
-                value = text, onValueChange = { text = it },
-                label = { Text("Your notes (editable)") },
-                modifier = Modifier.fillMaxWidth().heightIn(min = 200.dp)
-            )
+            if (previewMode) {
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Text("Notes Preview", style = MaterialTheme.typography.titleMedium)
+                        HorizontalDivider()
+                        if (text.isBlank()) {
+                            Text("No notes yet. Tap \"Make AI notes\" above.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        } else {
+                            MarkdownText(text)
+                        }
+                    }
+                }
+            } else {
+                OutlinedTextField(
+                    value = text, onValueChange = { text = it },
+                    label = { Text("Your notes (editable)") },
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 300.dp)
+                )
+            }
         }
         item {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
