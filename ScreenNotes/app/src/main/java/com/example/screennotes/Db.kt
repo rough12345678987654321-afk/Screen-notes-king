@@ -25,6 +25,7 @@ data class Shot(
 interface NoteDao {
     @Query("SELECT * FROM Note ORDER BY createdAt DESC") fun notes(): Flow<List<Note>>
     @Query("SELECT * FROM Note WHERE id = :id") fun note(id: Long): Flow<Note?>
+    @Query("SELECT * FROM Note WHERE id = :id") suspend fun noteOnce(id: Long): Note?
     @Query("SELECT * FROM Shot WHERE noteId = :id ORDER BY timeMs") fun shots(id: Long): Flow<List<Shot>>
     @Query("SELECT * FROM Shot WHERE noteId = :id ORDER BY timeMs") suspend fun shotsOnce(id: Long): List<Shot>
 

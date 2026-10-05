@@ -4,9 +4,12 @@ import android.Manifest
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.pdf.PdfRenderer
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Bundle
+import android.os.ParcelFileDescriptor
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -141,6 +144,108 @@ fun Home(onOpen: (Long) -> Unit) {
             label = { Text("Gemini API key (free, from aistudio.google.com/apikey)") },
             modifier = Modifier.fillMaxWidth(), singleLine = true
         )
+
+        var urlInput by remember { mutableStateOf("") }
+        var importing by remember { mutableStateOf(false) }
+        var importStatus by remember { mutableStateOf("") }
+
+        val pdfLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            if (uri != null) {
+                importing = true
+                importStatus = "Importing PDF pages..."
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        val pfd = ctx.contentResolver.openFileDescriptor(uri, "r")
+                        if (pfd != null) {
+                            val renderer = PdfRenderer(pfd)
+                            val title = "PDF " + java.text.SimpleDateFormat("d MMM, HH:mm", java.util.Locale.getDefault()).format(java.util.Date())
+                            val nId = dao.insertNote(Note(title = title, createdAt = System.currentTimeMillis()))
+                            val shotsDir = File(ctx.filesDir, "shots/$nId").apply { mkdirs() }
+                            
+                            val pageCount = minOf(renderer.pageCount, 50)
+                            for (i in 0 until pageCount) {
+                                val page = renderer.openPage(i)
+                                val bmp = Bitmap.createBitmap(1280, (1280f * page.height / page.width).toInt(), Bitmap.Config.ARGB_8888)
+                                page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                                page.close()
+                                
+                                val file = File(shotsDir, "${i * 1000L}.jpg")
+                                file.outputStream().use { bmp.compress(Bitmap.CompressFormat.JPEG, 90, it) }
+                                dao.insertShot(Shot(noteId = nId, path = file.absolutePath, ocrText = "PDF page ${i+1}", timeMs = i * 1000L))
+                            }
+                            renderer.close()
+                            pfd.close()
+                            withContext(Dispatchers.Main) {
+                                importing = false
+                                onOpen(nId)
+                            }
+                        }
+                    } catch (e: Exception) {
+                        withContext(Dispatchers.Main) {
+                            importing = false
+                            importStatus = "Error: ${e.message}"
+                        }
+                    }
+                }
+            }
+        }
+
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+            OutlinedButton(
+                enabled = !importing,
+                onClick = { pdfLauncher.launch(arrayOf("application/pdf")) },
+                modifier = Modifier.weight(1f)
+            ) {
+                Text(if (importing && importStatus.contains("PDF")) importStatus else "Import PDF / Slides")
+            }
+        }
+
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+            OutlinedTextField(
+                value = urlInput,
+                onValueChange = { urlInput = it },
+                label = { Text("YouTube / Drive / Web link") },
+                modifier = Modifier.weight(1f),
+                singleLine = true
+            )
+            Button(
+                enabled = !importing && urlInput.isNotBlank(),
+                onClick = {
+                    val link = urlInput.trim()
+                    urlInput = ""
+                    importing = true
+                    importStatus = "Processing link..."
+                    scope.launch(Dispatchers.IO) {
+                        try {
+                            val title = "Link Note " + java.text.SimpleDateFormat("d MMM, HH:mm", java.util.Locale.getDefault()).format(java.util.Date())
+                            val nId = dao.insertNote(Note(title = title, createdAt = System.currentTimeMillis()))
+                            val shotsDir = File(ctx.filesDir, "shots/$nId").apply { mkdirs() }
+                            
+                            // If it's YouTube or web article / drive, extract key info or generate summary note via Gemini directly or via simulated snapshots
+                            val prompt = "Create comprehensive structured study notes with explanations, formulas and key points from this link or topic: $link"
+                            val notes = Gemini.makeNotes(key.ifBlank { prefs.getString("key", "") ?: "" }, listOf(Slide(prompt, null)))
+                            
+                            dao.updateNote(dao.noteOnce(nId)?.copy(aiNotes = notes) ?: Note(id = nId, title = title, createdAt = System.currentTimeMillis(), aiNotes = notes))
+                            
+                            withContext(Dispatchers.Main) {
+                                importing = false
+                                onOpen(nId)
+                            }
+                        } catch (e: Exception) {
+                            withContext(Dispatchers.Main) {
+                                importing = false
+                                importStatus = "Error: ${e.message}"
+                            }
+                        }
+                    }
+                }
+            ) {
+                Text("Process Link")
+            }
+        }
+        if (importing && !importStatus.contains("PDF")) {
+            Text(importStatus, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+        }
         Text("History", style = MaterialTheme.typography.titleMedium)
         LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             items(notes) { n ->
