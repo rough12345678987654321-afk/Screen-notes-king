@@ -7,6 +7,20 @@ import android.content.Intent
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Bundle
+import android.widget.Toast
+import android.text.TextPaint
+import android.text.StaticLayout
+import android.text.Layout
+import android.graphics.Color
+import android.graphics.pdf.PdfDocument
+import android.print.PrintManager
+import android.print.PrintDocumentAdapter
+import android.print.PrintDocumentInfo
+import android.print.PageRange
+import android.print.PrintAttributes
+import android.os.ParcelFileDescriptor
+import android.os.CancellationSignal
+import java.io.FileOutputStream
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -249,6 +263,82 @@ fun Detail(id: Long, onBack: () -> Unit) {
                     val send = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, text)
                     ctx.startActivity(Intent.createChooser(send, "Share notes"))
                 }) { Text("Share / Export") }
+                OutlinedButton(onClick = {
+                    try {
+                        val printManager = ctx.getSystemService(Context.PRINT_SERVICE) as PrintManager
+                        val jobName = (note?.title ?: "Screen Notes") + " Notes"
+                        val printAdapter = object : PrintDocumentAdapter() {
+                            override fun onWrite(
+                                pages: Array<out PageRange>,
+                                destination: ParcelFileDescriptor,
+                                cancellationSignal: CancellationSignal,
+                                callback: WriteResultCallback
+                            ) {
+                                val pdfDoc = PdfDocument()
+                                val pageInfo = PdfDocument.PageInfo.Builder(595, 842, 1).create()
+                                val page = pdfDoc.startPage(pageInfo)
+                                
+                                val canvas = page.canvas
+                                val paint = TextPaint().apply {
+                                    textSize = 12f
+                                    color = Color.BLACK
+                                }
+                                val titlePaint = TextPaint().apply {
+                                    textSize = 20f
+                                    isFakeBoldText = true
+                                    color = Color.BLACK
+                                }
+
+                                canvas.drawText(note?.title ?: "Screen Notes", 40f, 60f, titlePaint)
+
+                                val contentStr = text.ifBlank { "No notes" }
+                                val layout = if (Build.VERSION.SDK_INT >= 23) {
+                                    StaticLayout.Builder.obtain(
+                                        contentStr, 0, contentStr.length, paint, 515
+                                    ).setAlignment(Layout.Alignment.ALIGN_NORMAL)
+                                     .setLineSpacing(1f, 1.2f)
+                                     .build()
+                                } else {
+                                    @Suppress("DEPRECATION")
+                                    StaticLayout(
+                                        contentStr, paint, 515,
+                                        Layout.Alignment.ALIGN_NORMAL, 1.2f, 0f, false
+                                    )
+                                }
+
+                                canvas.save()
+                                canvas.translate(40f, 90f)
+                                layout.draw(canvas)
+                                canvas.restore()
+
+                                pdfDoc.finishPage(page)
+                                try {
+                                    pdfDoc.writeTo(FileOutputStream(destination.fileDescriptor))
+                                    pdfDoc.close()
+                                    callback.onWriteFinished(arrayOf(PageRange.ALL_PAGES))
+                                } catch (e: Exception) {
+                                    callback.onWriteFailed(e.message)
+                                }
+                            }
+
+                            override fun onLayout(
+                                oldAttributes: PrintAttributes?,
+                                newAttributes: PrintAttributes?,
+                                cancellationSignal: CancellationSignal?,
+                                callback: LayoutResultCallback?,
+                                extras: android.os.Bundle?
+                            ) {
+                                val builder = PrintDocumentInfo.Builder((note?.title ?: "Notes") + ".pdf")
+                                    .setContentType(PrintDocumentInfo.CONTENT_TYPE_DOCUMENT)
+                                    .setPageCount(1)
+                                callback?.onLayoutFinished(builder.build(), true)
+                            }
+                        }
+                        printManager.print(jobName, printAdapter, PrintAttributes.Builder().build())
+                    } catch (e: Exception) {
+                        Toast.makeText(ctx, "Print / PDF error: ${e.message}", Toast.LENGTH_SHORT).show()
+                    }
+                }) { Text("Save as PDF") }
             }
         }
         item { Text("Captured screens (${shots.size})", style = MaterialTheme.typography.titleMedium) }
