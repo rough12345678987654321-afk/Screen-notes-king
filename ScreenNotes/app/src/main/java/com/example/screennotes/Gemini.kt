@@ -12,7 +12,7 @@ class Slide(val ocr: String, val jpeg: ByteArray?)
 /** Calls Google's Gemini API (free tier). Get a key at https://aistudio.google.com/apikey */
 object Gemini {
     // If Google retires this model name, change it here.
-    private const val MODEL = "gemini-3.8-flash"
+    private const val MODEL = "gemini-1.5-flash"
     private const val MAX_IMAGES = 40
 
     private const val PROMPT = """You are an expert note-taker. Below are consecutive screenshots from a lecture or video,
