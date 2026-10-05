@@ -7,6 +7,11 @@ import android.content.Intent
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Bundle
+import android.print.PrintAttributes
+import android.print.PrintDocumentAdapter
+import android.print.PrintManager
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -25,6 +30,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.viewinterop.AndroidView
 import coil.compose.AsyncImage
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -172,7 +178,7 @@ fun Detail(id: Long, onBack: () -> Unit) {
     val prefs = remember { ctx.getSharedPreferences("p", Context.MODE_PRIVATE) }
     var text by remember(note?.id) { mutableStateOf(note?.aiNotes ?: "") }
     var busy by remember { mutableStateOf(false) }
-    var previewMode by remember { mutableStateOf(true) }
+    var previewMode by remember { mutableStateOf("markdown") } // "markdown", "html", "images"
 
     // Auto-generate AI notes when opening the page if aiNotes is empty and shots are available
     LaunchedEffect(note?.id, shots.size) {
@@ -197,49 +203,148 @@ fun Detail(id: Long, onBack: () -> Unit) {
 
     LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item {
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                OutlinedButton(onClick = onBack) { Text("Back") }
-                Button(enabled = !busy && shots.isNotEmpty(), onClick = {
-                    val key = prefs.getString("key", "") ?: ""
-                    if (key.isBlank()) { text = "Paste your Gemini API key on the home screen first."; return@Button }
-                    busy = true
-                    scope.launch {
-                        text = withContext(Dispatchers.IO) {
-                            try {
-                                val slides = shots.map { s ->
-                                    Slide(s.ocrText, runCatching { File(s.path).readBytes() }.getOrNull())
-                                }
-                                Gemini.makeNotes(key, slides)
-                            } catch (e: Exception) { "Error: ${e.message}" }
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    OutlinedButton(onClick = onBack) { Text("Back") }
+                    Button(enabled = !busy && shots.isNotEmpty(), onClick = {
+                        val key = prefs.getString("key", "") ?: ""
+                        if (key.isBlank()) { text = "Paste your Gemini API key on the home screen first."; return@Button }
+                        busy = true
+                        scope.launch {
+                            text = withContext(Dispatchers.IO) {
+                                try {
+                                    val slides = shots.map { s ->
+                                        Slide(s.ocrText, runCatching { File(s.path).readBytes() }.getOrNull())
+                                    }
+                                    Gemini.makeNotes(key, slides)
+                                } catch (e: Exception) { "Error: ${e.message}" }
+                            }
+                            busy = false
                         }
-                        busy = false
-                    }
-                }) { Text(if (busy) "Writing..." else "Make AI notes") }
-                Spacer(Modifier.weight(1f))
-                OutlinedButton(onClick = { previewMode = !previewMode }) {
-                    Text(if (previewMode) "Edit notes" else "Preview notes")
+                    }) { Text(if (busy) "Writing..." else "Make AI notes") }
+                    Spacer(Modifier.weight(1f))
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
+                    FilterChip(selected = previewMode == "markdown", onClick = { previewMode = "markdown" }, label = { Text("Preview") })
+                    FilterChip(selected = previewMode == "html", onClick = { previewMode = "html" }, label = { Text("HTML view") })
+                    FilterChip(selected = previewMode == "images", onClick = { previewMode = "images" }, label = { Text("Images & Sources") })
+                    FilterChip(selected = previewMode == "edit", onClick = { previewMode = "edit" }, label = { Text("Edit") })
                 }
             }
         }
         item {
-            if (previewMode) {
-                Card(Modifier.fillMaxWidth()) {
-                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                        Text("Notes Preview", style = MaterialTheme.typography.titleMedium)
-                        HorizontalDivider()
-                        if (text.isBlank()) {
-                            Text("No notes yet. Tap \"Make AI notes\" above.", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        } else {
-                            MarkdownText(text)
+            when (previewMode) {
+                "markdown" -> {
+                    Card(Modifier.fillMaxWidth()) {
+                        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                            Text("Notes Preview", style = MaterialTheme.typography.titleMedium)
+                            HorizontalDivider()
+                            if (text.isBlank()) {
+                                Text("No notes yet. Tap \"Make AI notes\" above.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            } else {
+                                MarkdownText(text)
+                            }
                         }
                     }
                 }
-            } else {
-                OutlinedTextField(
-                    value = text, onValueChange = { text = it },
-                    label = { Text("Your notes (editable)") },
-                    modifier = Modifier.fillMaxWidth().heightIn(min = 300.dp)
-                )
+                "html" -> {
+                    Card(Modifier.fillMaxWidth()) {
+                        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                            Text("HTML Preview & PDF Export", style = MaterialTheme.typography.titleMedium)
+                            HorizontalDivider()
+                            val htmlContent = remember(text) { markdownToHtml(note?.title ?: "Study Notes", text) }
+                            Box(Modifier.fillMaxWidth().height(350.dp)) {
+                                AndroidView(
+                                    factory = { c ->
+                                        WebView(c).apply {
+                                            webViewClient = WebViewClient()
+                                            settings.javaScriptEnabled = true
+                                        }
+                                    },
+                                    update = { webView ->
+                                        webView.loadDataWithBaseURL(null, htmlContent, "text/html", "UTF-8", null)
+                                    },
+                                    modifier = Modifier.fillMaxSize()
+                                )
+                            }
+                            Button(onClick = {
+                                val html = markdownToHtml(note?.title ?: "Study Notes", text)
+                                val printManager = ctx.getSystemService(Context.PRINT_SERVICE) as PrintManager
+                                val printAdapter = object : PrintDocumentAdapter() {
+                                    private var webView: WebView? = null
+                                    override fun onLayout(
+                                        oldAttributes: PrintAttributes?,
+                                        newAttributes: PrintAttributes?,
+                                        cancellationSignal: android.os.CancellationSignal?,
+                                        callback: LayoutResultCallback?,
+                                        extras: Bundle?
+                                    ) {
+                                        webView = WebView(ctx).apply {
+                                            webViewClient = object : WebViewClient() {
+                                                override fun onPageFinished(view: WebView?, url: String?) {
+                                                    val builder = android.print.PrintDocumentInfo.Builder("${note?.title ?: "Notes"}.pdf")
+                                                        .setContentType(android.print.PrintDocumentInfo.CONTENT_TYPE_DOCUMENT)
+                                                        .setPageCount(android.print.PrintDocumentInfo.PAGE_COUNT_UNKNOWN)
+                                                    callback?.onLayoutFinished(builder.build(), true)
+                                                }
+                                            }
+                                            loadDataWithBaseURL(null, html, "text/html", "UTF-8", null)
+                                        }
+                                    }
+                                    override fun onWrite(
+                                        pages: Array<out android.print.PageRange>?,
+                                        destination: android.os.ParcelFileDescriptor?,
+                                        cancellationSignal: android.os.CancellationSignal?,
+                                        callback: WriteResultCallback?
+                                    ) {
+                                        webView?.let {
+                                            val adapter = it.createPrintDocumentAdapter("StudyNotes")
+                                            adapter.onWrite(pages, destination, cancellationSignal, callback)
+                                        }
+                                    }
+                                }
+                                printManager.print("${note?.title ?: "Study Notes"} PDF", printAdapter, PrintAttributes.Builder().build())
+                            }, modifier = Modifier.fillMaxWidth()) {
+                                Text("Save as PDF file")
+                            }
+                        }
+                    }
+                }
+                "images" -> {
+                    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Text("Captured screens & Google sources (${shots.size})", style = MaterialTheme.typography.titleMedium)
+                        if (shots.isEmpty()) {
+                            Text("No captured screens.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        } else {
+                            shots.forEach { s ->
+                                Card(Modifier.fillMaxWidth()) {
+                                    Column(Modifier.padding(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                        AsyncImage(model = File(s.path), contentDescription = null, modifier = Modifier.fillMaxWidth())
+                                        if (s.ocrText.isNotBlank()) Text(s.ocrText, style = MaterialTheme.typography.bodySmall)
+                                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                                            val query = s.ocrText.take(60).trim().ifBlank { note?.title ?: "JEE study" }
+                                            OutlinedButton(onClick = {
+                                                val intent = Intent(Intent.ACTION_VIEW, android.net.Uri.parse("https://www.google.com/search?q=${android.net.Uri.encode(query)}"))
+                                                ctx.startActivity(intent)
+                                            }) { Text("Search on Google") }
+                                            Spacer(Modifier.weight(1f))
+                                            TextButton(onClick = {
+                                                scope.launch(Dispatchers.IO) { File(s.path).delete(); dao.deleteShot(s) }
+                                            }) { Text("Delete this screenshot") }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                else -> {
+                    OutlinedTextField(
+                        value = text, onValueChange = { text = it },
+                        label = { Text("Your notes (editable)") },
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 300.dp)
+                    )
+                }
             }
         }
         item {
@@ -251,17 +356,6 @@ fun Detail(id: Long, onBack: () -> Unit) {
                 }) { Text("Share / Export") }
             }
         }
-        item { Text("Captured screens (${shots.size})", style = MaterialTheme.typography.titleMedium) }
-        items(shots) { s ->
-            Card(Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    AsyncImage(model = File(s.path), contentDescription = null, modifier = Modifier.fillMaxWidth())
-                    if (s.ocrText.isNotBlank()) Text(s.ocrText, style = MaterialTheme.typography.bodySmall)
-                    TextButton(onClick = {
-                        scope.launch(Dispatchers.IO) { File(s.path).delete(); dao.deleteShot(s) }
-                    }) { Text("Delete this screenshot") }
-                }
-            }
-        }
     }
 }
+

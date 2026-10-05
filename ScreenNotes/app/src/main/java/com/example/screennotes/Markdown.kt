@@ -157,6 +157,53 @@ private fun AnnotatedString.Builder.appendInline(s: String, link: Color, codeBg:
 fun inlineMarkdown(s: String, link: Color, codeBg: Color): AnnotatedString =
     buildAnnotatedString { appendInline(s, link, codeBg) }
 
+fun markdownToHtml(title: String, md: String): String {
+    val blocks = parseBlocks(md)
+    val bodyHtml = StringBuilder()
+    for (b in blocks) {
+        when (b) {
+            is MdBlock.Heading -> bodyHtml.append("<h${b.level}>${escapeHtml(b.text)}</h${b.level}>\n")
+            is MdBlock.Para -> bodyHtml.append("<p>${escapeHtml(b.text)}</p>\n")
+            is MdBlock.Bullet -> bodyHtml.append("<ul><li>${escapeHtml(b.text)}</li></ul>\n")
+            is MdBlock.Code -> bodyHtml.append("<pre><code>${escapeHtml(b.text)}</code></pre>\n")
+            is MdBlock.Quote -> bodyHtml.append("<blockquote>${escapeHtml(b.text)}</blockquote>\n")
+            MdBlock.Rule -> bodyHtml.append("<hr/>\n")
+        }
+    }
+    return """
+        <!DOCTYPE html>
+        <html>
+        <head>
+        <meta charset="utf-8">
+        <title>$title</title>
+        <style>
+          body { font-family: sans-serif; padding: 20px; line-height: 1.6; color: #222; }
+          h1, h2, h3 { color: #333; margin-top: 24px; }
+          p { margin: 8px 0; }
+          ul { margin: 8px 0; padding-left: 24px; }
+          pre { background: #f5f5f5; padding: 12px; border-radius: 6px; overflow-x: auto; font-family: monospace; font-size: 13px; }
+          blockquote { border-left: 4px solid #ccc; margin: 0; padding-left: 12px; color: #555; }
+          hr { border: none; border-top: 1px solid #ddd; margin: 20px 0; }
+        </style>
+        </head>
+        <body>
+        <h1>$title</h1>
+        $bodyHtml
+        </body>
+        </html>
+    """.trimIndent()
+}
+
+private fun escapeHtml(s: String): String = s
+    .replace("&", "&amp;")
+    .replace("<", "&lt;")
+    .replace(">", "&gt;")
+    .replace("\"", "&quot;")
+    .replace("'", "&#39;")
+    .replace(Regex("""\*\*(.+?)\*\*"""), "<b>$1</b>")
+    .replace(Regex("""\*(.+?)\*"""), "<i>$1</i>")
+    .replace(Regex("""`([^`]+)`"""), "<code>$1</code>")
+
 /** One line of text with inline Markdown (bold, `code`, links). */
 @Composable
 fun InlineMd(text: String, style: TextStyle = MaterialTheme.typography.bodyMedium, color: Color = Color.Unspecified) {
