@@ -10,6 +10,7 @@ import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Bundle
 import android.graphics.Color
+import android.util.Base64
 import android.graphics.pdf.PdfDocument
 import android.os.CancellationSignal
 import android.os.ParcelFileDescriptor
@@ -30,6 +31,7 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -41,8 +43,10 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color as UiColor
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.viewinterop.AndroidView
 import coil.compose.AsyncImage
 import kotlinx.coroutines.Dispatchers
@@ -333,6 +337,28 @@ fun Detail(id: Long, onBack: () -> Unit) {
     var previewMode by remember { mutableStateOf("markdown") } // "markdown", "html", "images"
     var notice by remember { mutableStateOf("") }
     var confirmRegen by remember { mutableStateOf(false) }
+    var pdfBusy by remember { mutableStateOf(false) }
+    var pdfMsg by remember { mutableStateOf("") }
+    var zoomPath by remember { mutableStateOf<String?>(null) }
+
+    // base64 of every captured slide (downscaled), keyed by the [Screenshot N] number
+    val shotImages = remember(shots) {
+        shots.mapIndexedNotNull { i, sh ->
+            runCatching { File(sh.path).readBytes() }.getOrNull()
+                ?.let { b -> (i + 1) to Base64.encodeToString(Gemini.shrinkForUpload(b), Base64.NO_WRAP) }
+        }.toMap()
+    }
+    val savePdf: () -> Unit = {
+        pdfBusy = true
+        pdfMsg = "Making PDF..."
+        val html = markdownToHtml(note?.title ?: "Study Notes", text, shotImages)
+        val name = ((note?.title ?: "ScreenNotes").replace(Regex("[^A-Za-z0-9 -]"), "").trim().take(40)
+            .ifBlank { "ScreenNotes" }) + ".pdf"
+        PdfExport.save(ctx, name, html) { msg, err ->
+            pdfBusy = false
+            pdfMsg = msg ?: ("PDF failed: $err")
+        }
+    }
 
     // (Re)generate the notes with the owner's keys and model; reports a fallback honestly.
     val regenerate: () -> Unit = {
@@ -400,6 +426,10 @@ fun Detail(id: Long, onBack: () -> Unit) {
                     Text(notice, style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
+                if (pdfMsg.isNotBlank()) {
+                    Text(pdfMsg, style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary)
+                }
                 if (confirmRegen) {
                     AlertDialog(
                         onDismissRequest = { confirmRegen = false },
@@ -441,7 +471,9 @@ fun Detail(id: Long, onBack: () -> Unit) {
                         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                             Text("HTML Preview & PDF Export", style = MaterialTheme.typography.titleMedium)
                             HorizontalDivider()
-                            val htmlContent = remember(text) { markdownToHtml(note?.title ?: "Study Notes", text) }
+                            val htmlContent = remember(text, shotImages) {
+                                markdownToHtml(note?.title ?: "Study Notes", text, shotImages)
+                            }
                             Box(Modifier.fillMaxWidth().height(350.dp)) {
                                 AndroidView(
                                     factory = { c ->
@@ -456,44 +488,7 @@ fun Detail(id: Long, onBack: () -> Unit) {
                                     modifier = Modifier.fillMaxSize()
                                 )
                             }
-                            Button(onClick = {
-                                val html = markdownToHtml(note?.title ?: "Study Notes", text)
-                                val printManager = ctx.getSystemService(Context.PRINT_SERVICE) as PrintManager
-                                val printAdapter = object : PrintDocumentAdapter() {
-                                    private var webView: WebView? = null
-                                    override fun onLayout(
-                                        oldAttributes: PrintAttributes?,
-                                        newAttributes: PrintAttributes?,
-                                        cancellationSignal: android.os.CancellationSignal?,
-                                        callback: LayoutResultCallback?,
-                                        extras: Bundle?
-                                    ) {
-                                        webView = WebView(ctx).apply {
-                                            webViewClient = object : WebViewClient() {
-                                                override fun onPageFinished(view: WebView?, url: String?) {
-                                                    val builder = android.print.PrintDocumentInfo.Builder("${note?.title ?: "Notes"}.pdf")
-                                                        .setContentType(android.print.PrintDocumentInfo.CONTENT_TYPE_DOCUMENT)
-                                                        .setPageCount(android.print.PrintDocumentInfo.PAGE_COUNT_UNKNOWN)
-                                                    callback?.onLayoutFinished(builder.build(), true)
-                                                }
-                                            }
-                                            loadDataWithBaseURL(null, html, "text/html", "UTF-8", null)
-                                        }
-                                    }
-                                    override fun onWrite(
-                                        pages: Array<out android.print.PageRange>?,
-                                        destination: android.os.ParcelFileDescriptor?,
-                                        cancellationSignal: android.os.CancellationSignal?,
-                                        callback: WriteResultCallback?
-                                    ) {
-                                        webView?.let {
-                                            val adapter = it.createPrintDocumentAdapter("StudyNotes")
-                                            adapter.onWrite(pages, destination, cancellationSignal, callback)
-                                        }
-                                    }
-                                }
-                                printManager.print("${note?.title ?: "Study Notes"} PDF", printAdapter, PrintAttributes.Builder().build())
-                            }, modifier = Modifier.fillMaxWidth()) {
+                            Button(enabled = !pdfBusy, onClick = savePdf, modifier = Modifier.fillMaxWidth()) {
                                 Text("Save as PDF file")
                             }
                         }
@@ -505,10 +500,14 @@ fun Detail(id: Long, onBack: () -> Unit) {
                         if (shots.isEmpty()) {
                             Text("No captured screens.", color = MaterialTheme.colorScheme.onSurfaceVariant)
                         } else {
-                            shots.forEach { s ->
+                            shots.forEachIndexed { i, s ->
                                 Card(Modifier.fillMaxWidth()) {
                                     Column(Modifier.padding(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                                        AsyncImage(model = File(s.path), contentDescription = null, modifier = Modifier.fillMaxWidth())
+                                        Text("Screenshot ${i + 1}", style = MaterialTheme.typography.titleSmall)
+                                        AsyncImage(
+                                            model = File(s.path), contentDescription = "Screenshot ${i + 1}",
+                                            modifier = Modifier.fillMaxWidth().clickable { zoomPath = s.path }
+                                        )
                                         if (s.ocrText.isNotBlank()) Text(s.ocrText, style = MaterialTheme.typography.bodySmall)
                                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                                             val query = s.ocrText.take(60).trim().ifBlank { note?.title ?: "JEE study" }
@@ -543,84 +542,20 @@ fun Detail(id: Long, onBack: () -> Unit) {
                     val send = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, text)
                     ctx.startActivity(Intent.createChooser(send, "Share notes"))
                 }) { Text("Share / Export") }
-                OutlinedButton(onClick = {
-                    try {
-                        val printManager = ctx.getSystemService(Context.PRINT_SERVICE) as PrintManager
-                        val jobName = (note?.title ?: "Screen Notes") + " Notes"
-                        val printAdapter = object : PrintDocumentAdapter() {
-                            override fun onWrite(
-                                pages: Array<out PageRange>,
-                                destination: ParcelFileDescriptor,
-                                cancellationSignal: CancellationSignal,
-                                callback: WriteResultCallback
-                            ) {
-                                val pdfDoc = PdfDocument()
-                                val pageInfo = PdfDocument.PageInfo.Builder(595, 842, 1).create()
-                                val page = pdfDoc.startPage(pageInfo)
-                                
-                                val canvas = page.canvas
-                                val paint = TextPaint().apply {
-                                    textSize = 12f
-                                    color = Color.BLACK
-                                }
-                                val titlePaint = TextPaint().apply {
-                                    textSize = 20f
-                                    isFakeBoldText = true
-                                    color = Color.BLACK
-                                }
+                OutlinedButton(enabled = !pdfBusy, onClick = savePdf) { Text("Save as PDF") }
+            }
+        }
+    }
 
-                                canvas.drawText(note?.title ?: "Screen Notes", 40f, 60f, titlePaint)
-
-                                val contentStr = text.ifBlank { "No notes" }
-                                val layout = if (Build.VERSION.SDK_INT >= 23) {
-                                    StaticLayout.Builder.obtain(
-                                        contentStr, 0, contentStr.length, paint, 515
-                                    ).setAlignment(Layout.Alignment.ALIGN_NORMAL)
-                                     .setLineSpacing(1f, 1.2f)
-                                     .build()
-                                } else {
-                                    @Suppress("DEPRECATION")
-                                    StaticLayout(
-                                        contentStr, paint, 515,
-                                        Layout.Alignment.ALIGN_NORMAL, 1.2f, 0f, false
-                                    )
-                                }
-
-                                canvas.save()
-                                canvas.translate(40f, 90f)
-                                layout.draw(canvas)
-                                canvas.restore()
-
-                                pdfDoc.finishPage(page)
-                                try {
-                                    pdfDoc.writeTo(FileOutputStream(destination.fileDescriptor))
-                                    pdfDoc.close()
-                                    callback.onWriteFinished(arrayOf(PageRange.ALL_PAGES))
-                                } catch (e: Exception) {
-                                    callback.onWriteFailed(e.message)
-                                }
-                            }
-
-                            override fun onLayout(
-                                oldAttributes: PrintAttributes?,
-                                newAttributes: PrintAttributes?,
-                                cancellationSignal: CancellationSignal?,
-                                callback: LayoutResultCallback?,
-                                extras: android.os.Bundle?
-                            ) {
-                                val builder = PrintDocumentInfo.Builder((note?.title ?: "Notes") + ".pdf")
-                                    .setContentType(PrintDocumentInfo.CONTENT_TYPE_DOCUMENT)
-                                    .setPageCount(1)
-                                callback?.onLayoutFinished(builder.build(), true)
-                            }
-                        }
-                        printManager.print(jobName, printAdapter, PrintAttributes.Builder().build())
-                    } catch (e: Exception) {
-                        Toast.makeText(ctx, "Print / PDF error: ${e.message}", Toast.LENGTH_SHORT).show()
-                    }
-                }) { Text("Save as PDF") }
+    val zp = zoomPath
+    if (zp != null) {
+        Dialog(onDismissRequest = { zoomPath = null }) {
+            Box(
+                Modifier.fillMaxSize().background(UiColor.Black.copy(alpha = 0.85f))
+                    .clickable { zoomPath = null }
+            ) {
+                AsyncImage(model = File(zp), contentDescription = null, modifier = Modifier.fillMaxSize())
             }
         }
     }
 }
-
