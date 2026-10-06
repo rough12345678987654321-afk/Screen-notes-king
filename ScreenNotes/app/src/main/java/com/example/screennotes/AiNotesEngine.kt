@@ -51,6 +51,23 @@ private data class AiSource(
 object AiNotesEngine {
     const val MODE_PREFERENCE = "notes_ai_mode"
     const val PREF_AI_INSTRUCTIONS = "ai_instructions"
+
+    /** The literal marker the completeness judge inserts where no capture shows the content. */
+    const val GAP_MARKER = "[gap: not visible in captures]"
+
+    /** How many gaps the completeness judge marked in a piece of notes text. */
+    fun countGaps(text: String): Int {
+        var count = 0
+        var from = 0
+        var at = text.indexOf(GAP_MARKER, from)
+        while (at >= 0) {
+            count++
+            from = at + GAP_MARKER.length
+            at = text.indexOf(GAP_MARKER, from)
+        }
+        return count
+    }
+
     private const val LEGACY_GEMINI_KEY = "key"
     private const val MAX_IMAGES = 40
     private const val IMAGE_WIDTH = 1024
@@ -164,7 +181,10 @@ object AiNotesEngine {
         return "Not ready · ${lastError.take(150)}"
     }
 
-    /** Makes notes in fast mode or in a three-call draft / draft / evidence-checked merge. */
+    /**
+     * Makes notes in fast mode or in a three-call draft / draft / evidence-checked merge, and then
+     * runs one final "thinking" pass that judges the result against the captures for completeness.
+     */
     fun makeNotes(
         keys: Map<AiFamily, String>,
         slides: List<Slide>,
@@ -179,9 +199,22 @@ object AiNotesEngine {
                 basePrompt + "\n\nSTUDENT'S OWN INSTRUCTIONS — follow these strictly:\n" + studentInstructions.trim()
             } else basePrompt
 
-        if (mode == NotesMode.FAST) return fast(candidates, keys, slides, withInstructions = ::withInstructions)
+        val drafted = compose(candidates, keys, slides, mode, ::withInstructions)
+        if (!drafted.succeeded) return drafted
+        return think(candidates, keys, slides, drafted, ::withInstructions)
+    }
+
+    /** Fast mode: one call. Top tier: two independent drafts plus an evidence-checked merge. */
+    private fun compose(
+        candidates: List<AiSource>,
+        keys: Map<AiFamily, String>,
+        slides: List<Slide>,
+        mode: NotesMode,
+        withInstructions: (String) -> String
+    ): NotesResult {
+        if (mode == NotesMode.FAST) return fast(candidates, keys, slides, withInstructions = withInstructions)
         if (readyFamilyCount(keys) < 2) {
-            val result = fast(candidates, keys, slides, withInstructions = ::withInstructions)
+            val result = fast(candidates, keys, slides, withInstructions = withInstructions)
             return result.copy(notice = "Top tier needs two ready AI families; used Fast instead.")
         }
 
@@ -240,6 +273,49 @@ object AiNotesEngine {
             draftOne.text, listOf(draftOne.source.label),
             "The merge service was unavailable, so these are the first provider's notes. ${merged.lastError}",
             NotesMode.FAST
+        )
+    }
+
+    /**
+     * The final "thinking" pass: a completeness judge. It receives the stitched OCR evidence of all
+     * captures plus the finished notes, and it has to
+     *  - verify sequence continuity (numbered steps, sentences cut mid-line, diagrams split across captures),
+     *  - reconstruct cut content from the two captures where that evidence exists, and
+     *  - mark content that is in NO capture with the literal [GAP_MARKER] text.
+     * It never invents formulas, constants or steps. If no provider can be reached for the judge,
+     * the notes are returned exactly as they were.
+     */
+    private fun think(
+        candidates: List<AiSource>,
+        keys: Map<AiFamily, String>,
+        slides: List<Slide>,
+        notes: NotesResult,
+        withInstructions: (String) -> String
+    ): NotesResult {
+        // Without captures there is no evidence to judge against, so the notes stay as they are.
+        if (notes.text.isBlank() || slides.isEmpty()) return notes
+        val evidence = buildString {
+            append("STITCHED OCR EVIDENCE FROM THE CAPTURES (in order):\n")
+            append(stitchedOcrEvidence(slides))
+            append("\n\nNOTES TO JUDGE:\n")
+            append(notes.text.take(MAX_DRAFT_CHARS))
+        }
+        // The judge works from the stitched text only (no images are uploaded again): its job is
+        // sequence continuity and honest gaps, not reading the slides a second time.
+        val result = runLadder(
+            candidates, keys, emptyList(), withInstructions(GAP_PROMPT), mergeEvidenceOverride = evidence
+        )
+        val output = result.output ?: return notes.copy(
+            notice = (notes.notice + " Completeness check unavailable: ${result.lastError}").trim()
+        )
+        // A judge that answered with much less than it was given did not do its job: keep the notes.
+        if (output.text.length < notes.text.length / 2) return notes.copy(
+            notice = (notes.notice + " Completeness check returned an unusable reply; the notes were kept as they were.").trim()
+        )
+        return notes.copy(
+            text = output.text,
+            sources = (notes.sources + output.source.label).distinct(),
+            notice = notes.notice
         )
     }
 
@@ -458,6 +534,17 @@ Write complete, clear, revision-ready Markdown notes from the supplied lecture e
 - Do not invent facts. If OCR is unclear, say so instead of guessing.
 - FORMULAS MUST BE PLAIN TEXT WITH UNICODE, NEVER LATEX: use H₂O, x², √, →, ⇌, ΔH, α, β, ∫, Σ, ≥ and similar symbols. Do not use dollar math delimiters or backslash commands.
 - Finish with ## ⭐ Quick recap, ## ⚠️ Exam traps, and ## 📌 Likely JEE questions.
+Return only the finished notes in Markdown."""
+
+    /** The final "thinking" pass: completeness judge. It may only rebuild what the captures contain. */
+    private val GAP_PROMPT = """You are the completeness judge for JEE study notes that were written from screen captures of a lecture.
+You are given the stitched OCR evidence of every capture, in order and with [capture boundary] markers, followed by the notes written from it.
+Your only job is to make those notes complete and honest. Follow these rules exactly:
+1. Verify sequence continuity: numbered steps that skip a number, sentences that stop mid-line, derivations that lose a line, tables and diagrams split across two captures.
+2. Where the evidence holds the missing half — usually the capture just before or just after — reconstruct the cut content ONCE and COMPLETE, and do not repeat the overlapping part.
+3. Where content is genuinely absent from ALL captures, insert exactly this marker, on its own line: [gap: not visible in captures]
+4. NEVER invent anything. No formula, constant, value, step, reaction or example that the evidence does not contain. When you are not sure, mark a gap instead of guessing.
+5. Change nothing else: keep the notes' order, wording, headings, Markdown, [Screenshot N] references and plain Unicode formulas exactly as they are.
 Return only the finished notes in Markdown."""
 }
 
