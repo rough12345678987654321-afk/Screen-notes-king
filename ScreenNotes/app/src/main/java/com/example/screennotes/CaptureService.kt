@@ -26,10 +26,22 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * Looks at the screen about twice a second. When the screen has settled, it compares it with the
- * last saved screenshot of this slide:
+ * Looks at the screen four times a second ([TICK_MS]).
+ *
+ * While the screen is moving (a video at 2x speed, a fast scroll) a MOTION EPISODE starts and only
+ * the SHARPEST frame of that episode is kept - sharpness is the gradient-energy sum of [features],
+ * so a half-drawn transition frame can never win. When the screen settles, or when the settled
+ * screen turns out to be a different slide ([compare] returns 2), that sharpest frame is saved
+ * instead of the last raw frame. An episode that never settles (a smooth pan) is judged after
+ * [MAX_EPISODE_MS] anyway, so a slide on screen for only ~1 second is still caught.
+ *
+ * Writes are throttled to one screenshot per [MIN_SAVE_GAP_MS], so fast scrolling cannot flood
+ * storage; a frame that has to wait is remembered in [pending] and written as soon as the gap
+ * opens - before the newer frame - which keeps short slides and their order.
+ *
+ * What is saved (unchanged):
  *   - nothing new            -> ignore
- *   - same content + MORE    -> REPLACE the old screenshot with the fuller one (e.g. teacher keeps writing)
+ *   - same content + MORE    -> REPLACE the old screenshot with the fuller one (teacher keeps writing)
  *   - old content changed    -> keep the old one and SAVE a new screenshot (a new slide)
  */
 class CaptureService : Service() {
@@ -39,7 +51,7 @@ class CaptureService : Service() {
         const val ACTION_STOP = "stop"
 
         // --- Tuning knobs ---
-        const val TICK_MS = 500L           // how often we look at the screen
+        const val TICK_MS = 250L           // how often we look at the screen (4 looks a second catches ~1 s slides)
         const val MOVING_THRESHOLD = 3.0   // bigger change between two looks = screen still moving (video/animation)
         const val SETTLE_TICKS = 2         // screen must stay still this many looks before we judge it
         const val GW = 64                  // the screen is split into GW x GH small cells
@@ -49,14 +61,50 @@ class CaptureService : Service() {
         const val MIN_ADDED = 2            // new content cells needed before we replace the old screenshot
         const val MIN_CONTENT_CELLS = 12   // an almost empty old screen counts as having no content
         const val WARMUP_MS = 3000L        // ignore the first seconds after Start (player UI, file picker)
+
+        // --- Sharpest-frame capture (fast playback) ---
+        const val MIN_SAVE_GAP_MS = 1200L  // at most one screenshot per ~1.2 s, so fast scrolling cannot flood storage
+        const val MAX_EPISODE_MS = 2000L   // judge a motion episode anyway once it has lasted this long
+        const val STILL_EPS = 0.6          // a settled screen that changed less than this is not judged again
+
+        // --- Border and player-overlay crop ---
+        const val BORDER_DIV = 8           // borders are measured on a small copy: cheap, and it can only crop too little
+        const val UNIFORM_TOL = 16         // biggest gray spread a row/column may have and still count as uniform
+        const val DARK_T = 26              // a row/column darker than this is letterbox or player chrome
+        const val EDGE_T = CONTENT_T       // average edge strength at which a row/column holds content (same measure as CONTENT_T)
+        const val MAX_V_SIDE = 0.42f       // the top or the bottom edge may never eat more than 42% of the height
+        const val MAX_H_SIDE = 0.30f       // the left or the right edge may never eat more than 30% of the width
+        const val MIN_KEEP_V = 0.16f       // at least 16% of the height survives cropping
+        const val MIN_KEEP_H = 0.40f       // at least 40% of the width survives cropping
+        const val OVERLAY_MAX = 0.12f      // a player-controls band may take at most 12% of the height
+        const val OVERLAY_SPIKE = 3.0f     // row brightness-variance spike that marks such a band
+        const val OVERLAY_VAR_FLOOR = 150f // ... and the spike must reach at least this (blank rows have ~0 variance)
+        const val OVERLAY_STEP = 8         // a translucent scrim also steps the row brightness by this much
+        const val OVERLAY_MIN_ROWS = 28    // a band shorter than this is a line of text, not a control bar
+        const val OVERLAY_HOLD_MS = 6000L  // keep cropping the band while the player shows and hides its controls
+        const val OVERLAY_CHECK_MS = 1000L // look for the band at most once a second
+        const val OVERLAY_SEGMENTS = 4     // the band must span the width, not just sit where some text happens to be
     }
 
     private class Feat(val mean: FloatArray, val energy: FloatArray)
+
+    /**
+     * A frame worth keeping: its bitmap (owned here until it is saved or recycled), its features, how
+     * sharp it is and the moment it was seen (which becomes the screenshot's place in the session).
+     */
+    private class Cand(val bmp: Bitmap, val feat: Feat, val sharp: Float, val timeMs: Long) {
+        fun recycle() { if (!bmp.isRecycled) bmp.recycle() }
+    }
 
     private class Cur(val noteId: Long, val timeMs: Long, var feat: Feat) {
         @Volatile var id = 0L
         @Volatile var path = ""
         @Volatile var version = 0
+    }
+
+    /** A small grayscale copy of the frame, used to find uniform borders on all four sides. */
+    private class Grid(val w: Int, val h: Int, val g: IntArray) {
+        fun at(x: Int, y: Int) = g[y * w + x]
     }
 
     private var projection: MediaProjection? = null
@@ -72,9 +120,16 @@ class CaptureService : Service() {
     private var w = 0
     private var h = 0
     private var lastFrame: IntArray? = null
+    private var lastJudgeSig: IntArray? = null
     private var stableTicks = 0
+    private var moving = false
+    private var episodeStartMs = 0L
+    private var best: Cand? = null        // sharpest frame of the running motion episode
+    private var pending: Cand? = null     // a finished frame waiting out the save throttle
+    private var lastSaveMs = 0L
     private var cur: Cur? = null
     private var captureScale = -1f
+    private var rowBuf: IntArray? = null  // one row of pixels, reused by the player-overlay check
 
     private val tick = object : Runnable {
         override fun run() {
@@ -155,34 +210,130 @@ class CaptureService : Service() {
         full.copyPixelsFromBuffer(plane.buffer)
         img.close()
         val raw = Bitmap.createBitmap(full, 0, 0, w, h)
+        if (raw != full) full.recycle()
         val bmp = cleanFrame(raw)
         if (bmp != raw) raw.recycle()
 
+        val now = System.currentTimeMillis()
         val sig = signature(bmp)
         val prev = lastFrame
         lastFrame = sig
 
         if (prev != null && diff(prev, sig) > MOVING_THRESHOLD) {
-            stableTicks = 0            // still moving, wait until it settles
+            // The screen is moving: start (or continue) a motion episode, keep only its sharpest frame.
+            if (!moving) {
+                moving = true
+                episodeStartMs = now
+                dropBest()          // the previous episode belongs to the previous slide
+            }
+            stableTicks = 0
+            consider(bmp, now)
+            // A long episode (smooth pan, endless scroll) is judged anyway, so nothing is missed.
+            if (now - episodeStartMs >= MAX_EPISODE_MS) {
+                val c = best
+                best = null
+                episodeStartMs = now
+                if (c != null) judge(c)
+            }
             return
         }
-        stableTicks++
-        if (stableTicks < SETTLE_TICKS) return
 
+        stableTicks++
+        if (stableTicks < SETTLE_TICKS) {
+            // Not settled yet. Inside an episode these steady frames join the sharpness contest too.
+            if (moving) consider(bmp, now) else bmp.recycle()
+            return
+        }
+
+        if (moving) {
+            // The episode has finished: save its sharpest frame, not the last raw one.
+            consider(bmp, now)
+            moving = false
+            val c = best
+            best = null
+            lastJudgeSig = sig
+            if (c != null) judge(c)
+            return
+        }
+
+        // A quiet screen: judge only when something really changed, or when a frame is waiting to be written.
+        val judged = lastJudgeSig
+        if (pending == null && judged != null && diff(judged, sig) < STILL_EPS) {
+            bmp.recycle()
+            return
+        }
+        lastJudgeSig = sig
+        judge(candidate(bmp, now))
+    }
+
+    // ------------------------------------------------------- sharpest frame of a motion episode
+
+    /** Sharpness of a frame: the gradient-energy sum of [features]. Blurry transition frames score low. */
+    private fun sharpness(f: Feat): Float = f.energy.sum()
+
+    private fun candidate(bmp: Bitmap, now: Long): Cand {
         val f = features(bmp)
-        // Black frames, empty players and other content-less screens are never worth keeping.
-        if (f.energy.count { it >= CONTENT_T } < MIN_CONTENT_CELLS) return
-        val c = cur
-        if (c == null) { startShot(bmp, f); return }
-        when (compare(c.feat, f)) {
-            2 -> startShot(bmp, f)
-            1 -> replaceShot(c, bmp, f)
-            else -> { }
+        return Cand(bmp, f, sharpness(f), now)
+    }
+
+    /** Keeps the sharpest frame of the running motion episode; the loser is recycled. */
+    private fun consider(bmp: Bitmap, now: Long) {
+        val c = candidate(bmp, now)
+        val b = best
+        if (b == null || c.sharp > b.sharp) {
+            b?.recycle()
+            best = c
+        } else {
+            c.recycle()
         }
     }
 
+    private fun dropBest() {
+        best?.recycle()
+        best = null
+    }
+
+    /**
+     * Decides what to do with the sharpest frame of a finished episode, writing at most one
+     * screenshot per [MIN_SAVE_GAP_MS]. A frame that has to wait stays in [pending] and is written
+     * as soon as the gap opens, so a slide that was visible for only ~1 second is not lost.
+     */
+    private fun judge(c: Cand) {
+        val now = System.currentTimeMillis()
+        val p = pending
+        if (p != null) {
+            if (now - lastSaveMs < MIN_SAVE_GAP_MS) {
+                // Still inside the throttle window: keep the sharper of the two waiting frames.
+                if (c.sharp > p.sharp) { pending = c; p.recycle() } else c.recycle()
+                return
+            }
+            pending = null
+            if (commit(p)) { pending = c; return }
+        }
+        if (now - lastSaveMs < MIN_SAVE_GAP_MS) { pending = c; return }
+        commit(c)
+    }
+
+    /** Saves this frame when it carries content and adds something. True when it reached the disk. */
+    private fun commit(c: Cand): Boolean {
+        // Black frames, empty players and other content-less screens are never worth keeping.
+        if (c.feat.energy.count { it >= CONTENT_T } < MIN_CONTENT_CELLS) { c.recycle(); return false }
+        val current = cur
+        if (current == null) { startShot(c); return true }
+        return when (compare(current.feat, c.feat)) {
+            2 -> { startShot(c); true }
+            1 -> { replaceShot(current, c); true }
+            else -> { c.recycle(); false }
+        }
+    }
+
+    // ---------------------------------------------------------------- frame cleaning
+
     private var chromeTop = -1
     private var chromeBottom = -1
+    private var overlayRows = 0
+    private var overlayUntilMs = 0L
+    private var overlayCheckMs = 0L
 
     /** Height of the status bar and navigation bar in capture pixels (they are never slide content). */
     private fun chromeCrop(): Pair<Int, Int> {
@@ -201,28 +352,235 @@ class CaptureService : Service() {
         return chromeTop to chromeBottom
     }
 
-    /** Crops away status bar, navigation bar and black letterbox rows so slides arrive clean. */
+    /**
+     * Crops away everything that is not slide content: the status and navigation bars, the
+     * translucent player-controls band that many players draw over the bottom edge, and uniform
+     * dark (or uniform light) borders on ALL FOUR sides - letterbox bars and player sidebars.
+     * A row or column is cropped only while it is uniform in colour and carries no gradient energy
+     * (the same measure [features] uses for content cells), so cropping never eats content.
+     */
     private fun cleanFrame(b: Bitmap): Bitmap {
         val (top, bottom) = chromeCrop()
         var y0 = top.coerceIn(0, b.height - 1)
         var y1 = (b.height - bottom).coerceIn(y0 + 1, b.height)
-        fun rowDark(y: Int): Boolean {
-            var sum = 0L
-            var n = 0
-            var x = 0
-            while (x < b.width) { sum += gray(b.getPixel(x, y)); n++; x += 16 }
-            return sum / max(n, 1) < 10
+        var x0 = 0
+        var x1 = b.width
+
+        // 1. Player controls over the bottom edge. Checked at most once a second and then held for a
+        //    while, so the crop - and with it the frame geometry - stays stable while they fade in and out.
+        val now = System.currentTimeMillis()
+        if (now < overlayUntilMs) {
+            y1 = max(y0 + 1, y1 - overlayRows)
+        } else if (now >= overlayCheckMs) {
+            overlayCheckMs = now + OVERLAY_CHECK_MS
+            val found = try { controlsOverlay(b, x0, x1, y0, y1) } catch (_: Exception) { 0 }
+            if (found > 0) {
+                overlayRows = found
+                overlayUntilMs = now + OVERLAY_HOLD_MS
+                y1 = max(y0 + 1, y1 - found)
+            }
         }
-        while (y0 < y1 - 1 && rowDark(y0)) y0++
-        while (y1 > y0 + 1 && rowDark(y1 - 1)) y1--
-        return if (y0 == 0 && y1 == b.height) b else Bitmap.createBitmap(b, 0, y0, b.width, y1 - y0)
+
+        // 2. Uniform borders on all four sides.
+        val grid = gridOf(b)
+        if (grid != null) {
+            val minKeepY = max(16, (b.height * MIN_KEEP_V).toInt())
+            val minKeepX = max(16, (b.width * MIN_KEEP_H).toInt())
+            // Rows first, then columns, twice: cropping a sidebar can uncover a letterbox bar.
+            repeat(2) {
+                val rows = uniformRows(grid)
+                val ny0 = max(y0, rows.first * BORDER_DIV)
+                val ny1 = if (rows.second < grid.h) min(y1, rows.second * BORDER_DIV) else y1
+                if (ny1 - ny0 >= minKeepY) { y0 = ny0; y1 = ny1 }
+                val cols = uniformCols(grid)
+                val nx0 = max(x0, cols.first * BORDER_DIV)
+                val nx1 = if (cols.second < grid.w) min(x1, cols.second * BORDER_DIV) else x1
+                if (nx1 - nx0 >= minKeepX) { x0 = nx0; x1 = nx1 }
+            }
+        }
+
+        if (x0 == 0 && y0 == 0 && x1 == b.width && y1 == b.height) return b
+        if (x1 - x0 < 8 || y1 - y0 < 8) return b
+        return Bitmap.createBitmap(b, x0, y0, x1 - x0, y1 - y0)
     }
+
+    /** A small grayscale copy of the frame: enough detail to see borders, cheap at 4 looks a second. */
+    private fun gridOf(b: Bitmap): Grid? {
+        return try {
+            val sw = b.width / BORDER_DIV
+            val sh = b.height / BORDER_DIV
+            if (sw < 16 || sh < 16) return null
+            val s = Bitmap.createScaledBitmap(b, sw, sh, true)
+            val px = IntArray(sw * sh)
+            s.getPixels(px, 0, sw, 0, 0, sw, sh)
+            if (s != b) s.recycle()
+            Grid(sw, sh, IntArray(px.size) { gray(px[it]) })
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /** Is this small row a border row: uniform in colour (or dark) and free of content edges? */
+    private fun borderRow(g: Grid, y: Int): Boolean {
+        var lo = 255
+        var hi = 0
+        var sum = 0L
+        var edge = 0L
+        var prev = -1
+        for (x in 0 until g.w) {
+            val v = g.at(x, y)
+            if (v < lo) lo = v
+            if (v > hi) hi = v
+            sum += v
+            if (prev >= 0) edge += abs(v - prev)
+            prev = v
+        }
+        val mean = sum / g.w
+        val edgeMean = edge.toFloat() / max(g.w - 1, 1)
+        return edgeMean < EDGE_T && (hi - lo <= UNIFORM_TOL || mean <= DARK_T)
+    }
+
+    /** Is this small column a border column: uniform in colour (or dark) and free of content edges? */
+    private fun borderCol(g: Grid, x: Int): Boolean {
+        var lo = 255
+        var hi = 0
+        var sum = 0L
+        var edge = 0L
+        var prev = -1
+        for (y in 0 until g.h) {
+            val v = g.at(x, y)
+            if (v < lo) lo = v
+            if (v > hi) hi = v
+            sum += v
+            if (prev >= 0) edge += abs(v - prev)
+            prev = v
+        }
+        val mean = sum / g.h
+        val edgeMean = edge.toFloat() / max(g.h - 1, 1)
+        return edgeMean < EDGE_T && (hi - lo <= UNIFORM_TOL || mean <= DARK_T)
+    }
+
+    /** First and (exclusive) last content row of the small copy, in small coordinates. */
+    private fun uniformRows(g: Grid): Pair<Int, Int> {
+        val maxSide = (g.h * MAX_V_SIDE).toInt()
+        val minKeep = max(16, (g.h * MIN_KEEP_V).toInt())
+        var t = 0
+        while (t < maxSide && g.h - t > minKeep && borderRow(g, t)) t++
+        var bot = g.h
+        while (bot > t && g.h - bot < maxSide && bot - t > minKeep && borderRow(g, bot - 1)) bot--
+        return t to bot
+    }
+
+    /** First and (exclusive) last content column of the small copy, in small coordinates. */
+    private fun uniformCols(g: Grid): Pair<Int, Int> {
+        val maxSide = (g.w * MAX_H_SIDE).toInt()
+        val minKeep = max(16, (g.w * MIN_KEEP_H).toInt())
+        var l = 0
+        while (l < maxSide && g.w - l > minKeep && borderCol(g, l)) l++
+        var r = g.w
+        while (r > l && g.w - r < maxSide && r - l > minKeep && borderCol(g, r - 1)) r--
+        return l to r
+    }
+
+    /**
+     * Height (in capture pixels) of a translucent player-controls band sitting on the bottom edge,
+     * or 0 when there is none. The band has to look like an overlay and not like content: it starts
+     * at the very bottom edge, it is at most [OVERLAY_MAX] of the height, its rows spike in
+     * brightness variance (icons, progress bar) or step in brightness (the translucent scrim), it
+     * contains at least one real variance spike, and it does that across most of the width - a line
+     * of notes text does not.
+     */
+    private fun controlsOverlay(b: Bitmap, x0: Int, x1: Int, y0: Int, y1: Int): Int {
+        val width = x1 - x0
+        val height = y1 - y0
+        if (width < 64 || height < 240) return 0
+        val bandMax = (height * OVERLAY_MAX).toInt()
+        if (bandMax < OVERLAY_MIN_ROWS) return 0
+        val rows = bandMax * 2                       // bottom half = the band, top half = what is above it
+        if (height < rows + 40) return 0
+        val top = y1 - rows
+        val buf = rowBuf?.takeIf { it.size >= width } ?: IntArray(width).also { rowBuf = it }
+
+        val mean = FloatArray(rows)
+        val variance = FloatArray(rows)
+        val segMean = Array(OVERLAY_SEGMENTS) { FloatArray(rows) }
+        val segVar = Array(OVERLAY_SEGMENTS) { FloatArray(rows) }
+        val segWidth = max(1, width / OVERLAY_SEGMENTS)
+
+        for (i in 0 until rows) {
+            b.getPixels(buf, 0, width, x0, top + i, width, 1)
+            var sum = 0L
+            var sumSq = 0L
+            var n = 0
+            val sSum = LongArray(OVERLAY_SEGMENTS)
+            val sSumSq = LongArray(OVERLAY_SEGMENTS)
+            val sN = IntArray(OVERLAY_SEGMENTS)
+            var x = 0
+            while (x < width) {
+                val v = gray(buf[x])
+                sum += v
+                sumSq += v.toLong() * v
+                n++
+                val s = min(x / segWidth, OVERLAY_SEGMENTS - 1)
+                sSum[s] += v
+                sSumSq[s] += v.toLong() * v
+                sN[s]++
+                x += 4
+            }
+            if (n == 0) return 0
+            mean[i] = sum.toFloat() / n
+            variance[i] = (sumSq.toFloat() / n) - mean[i] * mean[i]
+            for (s in 0 until OVERLAY_SEGMENTS) {
+                if (sN[s] == 0) continue
+                val m = sSum[s].toFloat() / sN[s]
+                segMean[s][i] = m
+                segVar[s][i] = (sSumSq[s].toFloat() / sN[s]) - m * m
+            }
+        }
+
+        // What the rows above the band look like: that is the content an overlay would cover.
+        val refMean = mean.copyOfRange(0, bandMax).average().toFloat()
+        val refVar = median(variance.copyOfRange(0, bandMax))
+        val spike = max(refVar * OVERLAY_SPIKE, OVERLAY_VAR_FLOOR)
+
+        fun overlayRow(i: Int): Boolean =
+            variance[i] >= spike || abs(mean[i] - refMean) >= OVERLAY_STEP
+
+        var i = rows - 1
+        if (!overlayRow(i)) return 0                   // a line of text has quiet rows below it
+        while (i - 1 >= bandMax && overlayRow(i - 1)) i--
+        val bandRows = rows - i
+        if (bandRows < OVERLAY_MIN_ROWS) return 0
+        var spikeRow = false
+        for (r in i until rows) if (variance[r] >= spike) { spikeRow = true; break }
+        if (!spikeRow) return 0                        // a plain letterbox bar is not a controls overlay
+
+        // And it has to span the width, the way a scrim or a progress bar does.
+        var wide = 0
+        for (s in 0 until OVERLAY_SEGMENTS) {
+            val bandM = segMean[s].copyOfRange(i, rows).average().toFloat()
+            val bandV = median(segVar[s].copyOfRange(i, rows))
+            val refM = segMean[s].copyOfRange(0, bandMax).average().toFloat()
+            val refV = median(segVar[s].copyOfRange(0, bandMax))
+            if (bandV >= max(refV * OVERLAY_SPIKE, OVERLAY_VAR_FLOOR) || abs(bandM - refM) >= OVERLAY_STEP) wide++
+        }
+        return if (wide >= OVERLAY_SEGMENTS - 1) bandRows else 0
+    }
+
+    private fun median(values: FloatArray): Float {
+        if (values.isEmpty()) return 0f
+        val sorted = values.copyOf().also { it.sort() }
+        return sorted[sorted.size / 2]
+    }
+
+    // ---------------------------------------------------------------- motion + content comparison
 
     /** Tiny 32x18 grayscale fingerprint of the screen (used to detect motion). */
     private fun signature(b: Bitmap): IntArray {
         val s = Bitmap.createScaledBitmap(b, 32, 18, true)
         val px = IntArray(32 * 18)
         s.getPixels(px, 0, 32, 0, 0, 32, 18)
+        if (s != b) s.recycle()
         return IntArray(px.size) { gray(px[it]) }
     }
 
@@ -242,6 +600,7 @@ class CaptureService : Service() {
         val s = Bitmap.createScaledBitmap(b, fw, fh, true)
         val px = IntArray(fw * fh)
         s.getPixels(px, 0, fw, 0, 0, fw, fh)
+        if (s != b) s.recycle()
         val g = IntArray(fw * fh) { gray(px[it]) }
         val mean = FloatArray(GW * GH)
         val energy = FloatArray(GW * GH)
@@ -287,28 +646,34 @@ class CaptureService : Service() {
         return if (lostFrac > LOST_LIMIT) 2 else if (added >= MIN_ADDED) 1 else 0
     }
 
-    /** Save a brand new screenshot (a new slide). */
-    private fun startShot(bmp: Bitmap, f: Feat) {
-        val t = System.currentTimeMillis() - startMs
-        val c = Cur(noteId, t, f)
-        cur = c
+    // ---------------------------------------------------------------- saving
+
+    /** Save a brand new screenshot (a new slide): the sharpest frame of the finished episode. */
+    private fun startShot(c: Cand) {
+        val t = max(0L, c.timeMs - startMs)
+        val shot = Cur(noteId, t, c.feat)
+        cur = shot
+        lastSaveMs = System.currentTimeMillis()
+        val bmp = c.bmp
         scope.launch(worker) {
-            val dir = File(filesDir, "shots/${c.noteId}").apply { mkdirs() }
+            val dir = File(filesDir, "shots/${shot.noteId}").apply { mkdirs() }
             val file = File(dir, "$t.jpg")
             file.outputStream().use { bmp.compress(Bitmap.CompressFormat.JPEG, 92, it) }
-            c.path = file.absolutePath
-            c.id = AppDb.get(this@CaptureService).dao()
-                .insertShot(Shot(noteId = c.noteId, path = c.path, ocrText = "", timeMs = t))
-            runOcr(c, bmp, 0)
+            shot.path = file.absolutePath
+            shot.id = AppDb.get(this@CaptureService).dao()
+                .insertShot(Shot(noteId = shot.noteId, path = shot.path, ocrText = "", timeMs = t))
+            runOcr(shot, bmp, 0)
         }
     }
 
     /** The new frame has everything the old one had, plus more: swap the old screenshot for it. */
-    private fun replaceShot(c: Cur, bmp: Bitmap, f: Feat) {
-        c.feat = f
+    private fun replaceShot(c: Cur, cand: Cand) {
+        c.feat = cand.feat
         c.version = c.version + 1
         val ver = c.version
         val t = System.currentTimeMillis() - startMs
+        lastSaveMs = System.currentTimeMillis()
+        val bmp = cand.bmp
         scope.launch(worker) {
             val old = File(c.path)
             val file = File(old.parentFile, "$t.jpg")
@@ -338,6 +703,9 @@ class CaptureService : Service() {
 
     override fun onDestroy() {
         handler.removeCallbacks(tick)
+        dropBest()
+        pending?.recycle()
+        pending = null
         display?.release()
         reader?.close()
         projection?.stop()

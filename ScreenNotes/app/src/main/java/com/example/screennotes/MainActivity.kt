@@ -490,6 +490,17 @@ suspend fun deleteNote(ctx: Context, id: Long) = withContext(Dispatchers.IO) {
     dao.deleteNote(id)
 }
 
+/**
+ * One-line notice for a note whose completeness judge had to mark missing content. It is derived
+ * from the notes text itself, so it is also there when the note is opened again later.
+ */
+private fun gapNotice(text: String): String {
+    val gaps = AiNotesEngine.countGaps(text)
+    if (gaps <= 0) return ""
+    val places = if (gaps == 1) "1 place is" else "$gaps places are"
+    return "⚠️ $places marked \"${AiNotesEngine.GAP_MARKER}\" — never visible in any capture."
+}
+
 @Composable
 fun Detail(id: Long, onBack: () -> Unit) {
     val ctx = LocalContext.current
@@ -519,7 +530,8 @@ fun Detail(id: Long, onBack: () -> Unit) {
     val showNotesResult: (NotesResult) -> Unit = { result ->
         text = result.text
         val sourceLine = if (result.sources.isEmpty()) "" else "Sources: ${result.sources.joinToString(" → ")}"
-        notice = listOf(result.notice, sourceLine).filter { it.isNotBlank() }.joinToString("\n")
+        notice = listOf(result.notice, gapNotice(result.text), sourceLine)
+            .filter { it.isNotBlank() }.joinToString("\n")
     }
 
     val startPdfExport: () -> Unit = {
@@ -625,6 +637,11 @@ fun Detail(id: Long, onBack: () -> Unit) {
                 if (notice.isNotBlank()) {
                     Text(notice, style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                val gaps = remember(text) { gapNotice(text) }
+                if (gaps.isNotBlank() && !notice.contains(AiNotesEngine.GAP_MARKER)) {
+                    Text(gaps, style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error)
                 }
                 if (confirmRegen) {
                     AlertDialog(

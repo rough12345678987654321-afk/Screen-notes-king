@@ -55,17 +55,36 @@ Ideas to try: "save fewer near-duplicate screenshots", "add a search box for my 
 notes as PDF", "make the notes prompt focus on JEE formulas and solved examples".
 
 ## How capture works
-It looks at the screen twice a second. When the screen settles, it compares it with the last
-saved screenshot:
+It looks at the screen four times a second. While the screen is moving (a video at 2x speed, a fast
+scroll) it keeps only the SHARPEST frame of that movement, and when the screen settles - or when the
+settled screen turns out to be a different slide - it saves that sharpest frame instead of the last
+half-drawn one. Slides that are on screen for only about a second are still caught, and at most one
+screenshot is written every 1.2 seconds, so fast scrolling cannot flood your storage.
+
+Every frame is cleaned before it is saved: the status bar, the navigation bar, uniform dark (or
+uniform light) borders on all four sides (letterbox bars, player sidebars) and a translucent
+player-controls band over the bottom edge are cropped away - never content.
+
+When the screen settles, it compares it with the last saved screenshot:
 - Nothing new: ignored.
 - Same content plus more (the teacher keeps writing): the old screenshot is REPLACED by the fuller one.
 - Old content changed: the old one is kept and a NEW screenshot is saved.
+
+After the notes are written, one final AI pass judges them against the captures: cut sentences,
+numbered steps and diagrams split over two captures are rebuilt from the captures that hold the
+missing half, and anything that is in no capture at all is marked
+`[gap: not visible in captures]` instead of being invented. The note shows a one-line notice when
+such a gap was marked.
 
 ## Tuning (top of CaptureService.kt)
 You can ask for these in the Updates tab, or change them yourself:
 - Saves too many near-duplicates? Raise LOST_LIMIT (0.06 to 0.12) or MIN_ADDED (2 to 4).
 - Misses small additions? Lower CONTENT_T (6 to 4) or MIN_ADDED (2 to 1).
-- Misses very fast slides? Lower TICK_MS (500 to 350) and SETTLE_TICKS (2 to 1).
+- Misses very fast slides? Lower SETTLE_TICKS (2 to 1), MIN_SAVE_GAP_MS (1200 to 800) or
+  MAX_EPISODE_MS (2000 to 1200). TICK_MS is already 250 (four looks a second).
+- Saves too many screenshots while scrolling? Raise MIN_SAVE_GAP_MS (1200 to 2000).
+- Crops too much (or too little) of a player's edges? MAX_V_SIDE / MAX_H_SIDE limit how much of the
+  height/width a border may take, and OVERLAY_MAX limits the player-controls band (0 to switch it off).
 
 ## Roadmap
 - Phase 2: short animated clips (GIF) when a slide animates
