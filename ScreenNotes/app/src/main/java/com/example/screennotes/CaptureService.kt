@@ -67,6 +67,9 @@ class CaptureService : Service() {
         const val MIN_SAVE_GAP_MS = 1200L  // at most one screenshot per ~1.2 s, so fast scrolling cannot flood storage
         const val MAX_EPISODE_MS = 1000L   // a long pan is sampled at least once a second
         const val MAX_PENDING_SHOTS = 3    // bounded oldest-first backlog while the save throttle is closed
+        const val NEAR_DUP_SIG_DIFF = 3.0  // mean absolute difference on the 32x18 gray signature
+        const val MAX_SCROLL_SHIFT = 9     // 9 of 36 feature rows = 25% of the screen height
+        const val MIN_SCROLL_COVERAGE = 0.50f // require enough overlapping content to trust an alignment
         const val STILL_EPS = 0.6          // a settled screen that changed less than this is not judged again
 
         // --- Border and player-overlay crop ---
@@ -92,7 +95,13 @@ class CaptureService : Service() {
      * A frame worth keeping: its bitmap (owned here until it is saved or recycled), its features, how
      * sharp it is and the moment it was seen (which becomes the screenshot's place in the session).
      */
-    private class Cand(val bmp: Bitmap, val feat: Feat, val sharp: Float, val timeMs: Long) {
+    private class Cand(
+        val bmp: Bitmap,
+        val feat: Feat,
+        val sharp: Float,
+        val timeMs: Long,
+        val signature: IntArray
+    ) {
         fun recycle() { if (!bmp.isRecycled) bmp.recycle() }
     }
 
@@ -127,6 +136,7 @@ class CaptureService : Service() {
     private var best: Cand? = null        // sharpest frame of the running motion episode
     private val pending = ArrayDeque<Cand>() // bounded, ordered frames waiting out the save throttle
     private var lastSaveMs = 0L
+    private var lastSavedSig: IntArray? = null
     private var cur: Cur? = null
     private var captureScale = -1f
     private var rowBuf: IntArray? = null  // one row of pixels, reused by the player-overlay check
@@ -229,7 +239,7 @@ class CaptureService : Service() {
                 dropBest()
             }
             stableTicks = 0
-            considerEpisodeFrame(bmp, now)
+            considerEpisodeFrame(bmp, now, sig)
             // A long pan or continuous animation still yields a candidate at least once a second.
             if (now - episodeStartMs >= MAX_EPISODE_MS) {
                 val c = best
@@ -243,13 +253,13 @@ class CaptureService : Service() {
         stableTicks++
         if (stableTicks < SETTLE_TICKS) {
             // Not settled yet. Inside an episode these steady frames join the sharpness contest too.
-            if (moving) considerEpisodeFrame(bmp, now) else bmp.recycle()
+            if (moving) considerEpisodeFrame(bmp, now, sig) else bmp.recycle()
             return
         }
 
         if (moving) {
             // Settling closes the episode; keep its sharpest frame, not the last raw frame.
-            considerEpisodeFrame(bmp, now)
+            considerEpisodeFrame(bmp, now, sig)
             moving = false
             val c = best
             best = null
@@ -265,7 +275,7 @@ class CaptureService : Service() {
             return
         }
         lastJudgeSig = sig
-        judge(candidate(bmp, now))
+        judge(candidate(bmp, now, sig))
     }
 
     // ------------------------------------------------------- sharpest frame of a motion episode
@@ -273,17 +283,17 @@ class CaptureService : Service() {
     /** Sharpness of a frame: the gradient-energy sum of [features]. Blurry transition frames score low. */
     private fun sharpness(f: Feat): Float = f.energy.sum()
 
-    private fun candidate(bmp: Bitmap, now: Long): Cand {
+    private fun candidate(bmp: Bitmap, now: Long, sig: IntArray): Cand {
         val f = features(bmp)
-        return Cand(bmp, f, sharpness(f), now)
+        return Cand(bmp, f, sharpness(f), now, sig)
     }
 
     /**
      * Collect the sharpest frame in the current visual segment. If its content changes into a
      * different slide before settling, close the previous segment and start a fresh contest.
      */
-    private fun considerEpisodeFrame(bmp: Bitmap, now: Long) {
-        val c = candidate(bmp, now)
+    private fun considerEpisodeFrame(bmp: Bitmap, now: Long, sig: IntArray) {
+        val c = candidate(bmp, now, sig)
         val previous = best
         if (previous != null && compare(previous.feat, c.feat) == 2) {
             best = null
@@ -346,6 +356,9 @@ class CaptureService : Service() {
     private fun commit(c: Cand): Boolean {
         // Black frames, empty players and other content-less screens are never worth keeping.
         if (c.feat.energy.count { it >= CONTENT_T } < MIN_CONTENT_CELLS) { c.recycle(); return false }
+        // A scrolling/signature fluctuation must not create another shot of the same saved image.
+        val saved = lastSavedSig
+        if (saved != null && diff(saved, c.signature) < NEAR_DUP_SIG_DIFF) { c.recycle(); return false }
         val current = cur
         if (current == null) { startShot(c); return true }
         return when (compare(current.feat, c.feat)) {
@@ -676,25 +689,59 @@ class CaptureService : Service() {
         return Feat(mean, energy)
     }
 
-    /** 0 = nothing new, 1 = same content plus something extra (replace), 2 = different slide (save new). */
+    /** 0 = nothing new, 1 = same content plus something extra, 2 = different slide. */
     private fun compare(old: Feat, new: Feat): Int {
-        var prevContent = 0
-        var lost = 0
-        var added = 0
-        for (i in old.energy.indices) {
-            val pe = old.energy[i]
-            val ne = new.energy[i]
-            if (pe >= CONTENT_T) {
-                prevContent++
-                val md = abs(old.mean[i] - new.mean[i])
-                if (ne < pe * 0.6f || (md > 45f && ne < pe + 6f)) lost++
-            } else if (ne >= CONTENT_T) {
-                added++
+        val prevContent = old.energy.count { it >= CONTENT_T }
+        if (prevContent < MIN_CONTENT_CELLS) {
+            val added = old.energy.indices.count { old.energy[it] < CONTENT_T && new.energy[it] >= CONTENT_T }
+            return if (added >= MIN_CONTENT_CELLS) 2 else 0
+        }
+
+        var bestShift = 0
+        var bestLostFraction = Double.POSITIVE_INFINITY
+        var bestCoverage = 1f
+        var bestAdded = 0
+        var bestScore = Double.POSITIVE_INFINITY
+        for (shift in -MAX_SCROLL_SHIFT..MAX_SCROLL_SHIFT) {
+            var compared = 0
+            var lost = 0
+            var added = 0
+            for (y in 0 until GH) {
+                val newY = y + shift
+                if (newY !in 0 until GH) continue // scrolling content can leave the viewport
+                for (x in 0 until GW) {
+                    val oldIndex = y * GW + x
+                    val newIndex = newY * GW + x
+                    val pe = old.energy[oldIndex]
+                    val ne = new.energy[newIndex]
+                    if (pe >= CONTENT_T) {
+                        compared++
+                        val md = abs(old.mean[oldIndex] - new.mean[newIndex])
+                        if (ne < pe * 0.6f || (md > 45f && ne < pe + 6f)) lost++
+                    } else if (ne >= CONTENT_T) {
+                        added++
+                    }
+                }
+            }
+            if (compared == 0) continue
+            val coverage = compared.toFloat() / prevContent
+            // Do not call a tiny coincidental match a scroll; at least half the old content must align.
+            if (shift != 0 && coverage < MIN_SCROLL_COVERAGE) continue
+            val lostFraction = lost.toDouble() / compared
+            // Prefer no movement when scores tie, while still allowing a real vertical translation to win.
+            val score = lostFraction + abs(shift) * 0.001
+            if (score < bestScore) {
+                bestScore = score
+                bestShift = shift
+                bestLostFraction = lostFraction
+                bestCoverage = coverage
+                bestAdded = added
             }
         }
-        if (prevContent < MIN_CONTENT_CELLS) return if (added >= MIN_CONTENT_CELLS) 2 else 0
-        val lostFrac = lost.toFloat() / prevContent
-        return if (lostFrac > LOST_LIMIT) 2 else if (added >= MIN_ADDED) 1 else 0
+
+        // A good non-zero alignment means the same document moved vertically, not a new slide.
+        if (bestShift != 0 && bestCoverage >= MIN_SCROLL_COVERAGE && bestLostFraction <= LOST_LIMIT) return 0
+        return if (bestLostFraction > LOST_LIMIT) 2 else if (bestAdded >= MIN_ADDED) 1 else 0
     }
 
     // ---------------------------------------------------------------- saving
@@ -704,6 +751,7 @@ class CaptureService : Service() {
         val t = max(0L, c.timeMs - startMs)
         val shot = Cur(noteId, t, c.feat)
         cur = shot
+        lastSavedSig = c.signature
         lastSaveMs = System.currentTimeMillis()
         val bmp = c.bmp
         scope.launch(worker) {
@@ -720,6 +768,7 @@ class CaptureService : Service() {
     /** The new frame has everything the old one had, plus more: swap the old screenshot for it. */
     private fun replaceShot(c: Cur, cand: Cand) {
         c.feat = cand.feat
+        lastSavedSig = cand.signature
         c.version = c.version + 1
         val ver = c.version
         val t = System.currentTimeMillis() - startMs

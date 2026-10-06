@@ -7,11 +7,18 @@ import android.util.Base64
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import kotlin.math.abs
 
 /** A captured screen: OCR text plus its JPEG screenshot (if available). */
-class Slide(val ocr: String, val jpeg: ByteArray?)
+class Slide(
+    val ocr: String,
+    val jpeg: ByteArray?,
+    val screenshotNumber: Int = 0,
+    val jpegFile: File? = null
+)
 
 enum class NotesMode { TOP_TIER, FAST }
 
@@ -69,7 +76,7 @@ object AiNotesEngine {
     }
 
     private const val LEGACY_GEMINI_KEY = "key"
-    private const val MAX_IMAGES = 40
+    private const val MAX_IMAGES = 24
     private const val IMAGE_WIDTH = 1024
     private const val IMAGE_QUALITY = 80
     private const val MAX_OCR_CHARS = 48_000
@@ -199,9 +206,89 @@ object AiNotesEngine {
                 basePrompt + "\n\nSTUDENT'S OWN INSTRUCTIONS — follow these strictly:\n" + studentInstructions.trim()
             } else basePrompt
 
-        val drafted = compose(candidates, keys, slides, mode, ::withInstructions)
+        // Avoid spending provider context and vision slots on repeated captures. Keep the original
+        // screenshot numbers so any [Screenshot N] references still point at the right saved image.
+        val distinctSlides = deduplicateSlides(slides)
+        val drafted = compose(candidates, keys, distinctSlides, mode, ::withInstructions)
         if (!drafted.succeeded) return drafted
-        return think(candidates, keys, slides, drafted)
+        return think(candidates, keys, distinctSlides, drafted)
+    }
+
+    /**
+     * Drop visually repeated shots before any provider call. Signatures are only 32x18 pixels, so
+     * even a long session is cheap to compare; OCR-only captures fall back to exact normalized text.
+     */
+    private fun deduplicateSlides(slides: List<Slide>): List<Slide> {
+        val kept = ArrayList<Slide>(slides.size)
+        val signatures = ArrayList<IntArray>()
+        val ocrOnly = HashSet<String>()
+        for ((index, raw) in slides.withIndex()) {
+            val slide = if (raw.screenshotNumber > 0) raw
+                else Slide(raw.ocr, raw.jpeg, index + 1, raw.jpegFile)
+            val sig = slide.jpeg?.let { imageSignature(it) }
+                ?: slide.jpegFile?.let { imageSignature(it) }
+            if (sig != null) {
+                if (signatures.any { nearDuplicate(it, sig) }) continue
+                signatures += sig
+            } else {
+                val normalized = slide.ocr.lowercase().replace(Regex("\\s+"), " ").trim()
+                if (normalized.isNotEmpty() && !ocrOnly.add(normalized)) continue
+            }
+            kept += slide
+        }
+        return kept
+    }
+
+    /** Keep an even temporal spread of the distinct, ordered images when a session has over 24. */
+    private fun visionSlides(slides: List<Slide>): List<Slide> {
+        val images = slides.filter { it.jpeg != null || it.jpegFile?.isFile == true }
+        if (images.size <= MAX_IMAGES) return images
+        val last = images.lastIndex.toLong()
+        return (0 until MAX_IMAGES).map { i ->
+            val index = (i.toLong() * last / (MAX_IMAGES - 1)).toInt()
+            images[index]
+        }
+    }
+
+    private fun imageSignature(bytes: ByteArray): IntArray? = imageSignature { options ->
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
+    }
+
+    private fun imageSignature(file: File): IntArray? = imageSignature { options ->
+        BitmapFactory.decodeFile(file.absolutePath, options)
+    }
+
+    private fun imageSignature(decode: (BitmapFactory.Options) -> Bitmap?): IntArray? {
+        return try {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            decode(bounds)
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+            var sample = 1
+            while (bounds.outWidth / (sample * 2) >= 64) sample *= 2
+            val bitmap = decode(BitmapFactory.Options().apply { inSampleSize = sample }) ?: return null
+            val thumb = Bitmap.createScaledBitmap(bitmap, 32, 18, true)
+            if (thumb !== bitmap) bitmap.recycle()
+            val pixels = IntArray(32 * 18)
+            thumb.getPixels(pixels, 0, 32, 0, 0, 32, 18)
+            thumb.recycle()
+            IntArray(pixels.size) { i ->
+                val c = pixels[i]
+                (((c shr 16) and 0xFF) * 3 + ((c shr 8) and 0xFF) * 6 + (c and 0xFF)) / 10
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun nearDuplicate(a: IntArray, b: IntArray): Boolean {
+        if (a.size != b.size || a.isEmpty()) return false
+        var total = 0L
+        val limit = 3.0 * a.size
+        for (i in a.indices) {
+            total += abs(a[i] - b[i])
+            if (total >= limit) return false
+        }
+        return total.toDouble() / a.size < 3.0
     }
 
     /** Fast mode: one call. Top tier: two independent drafts plus an evidence-checked merge. */
@@ -416,9 +503,11 @@ object AiNotesEngine {
     private fun geminiBody(systemPrompt: String, userEvidence: String, slides: List<Slide>): JSONObject {
         val parts = JSONArray()
         parts.put(JSONObject().put("text", "$systemPrompt\n\n$userEvidence"))
-        slides.take(MAX_IMAGES).forEachIndexed { index, slide ->
-            val jpeg = slide.jpeg ?: return@forEachIndexed
-            parts.put(JSONObject().put("text", "Screenshot ${index + 1} (use this image as evidence):"))
+        visionSlides(slides).forEachIndexed { index, slide ->
+            val jpeg = slide.jpeg ?: slide.jpegFile?.let { file -> runCatching { file.readBytes() }.getOrNull() }
+                ?: return@forEachIndexed
+            val number = slide.screenshotNumber.takeIf { it > 0 } ?: index + 1
+            parts.put(JSONObject().put("text", "Screenshot $number (use this image as evidence):"))
             parts.put(JSONObject().put(
                 "inline_data", JSONObject()
                     .put("mime_type", "image/jpeg")
@@ -473,7 +562,8 @@ object AiNotesEngine {
             if (remaining <= 0) return@forEachIndexed
             val text = slide.ocr.trim().ifBlank { "[No OCR text detected]" }
             val chunk = text.take(remaining)
-            val section = "[Screenshot ${index + 1} OCR]\n$chunk\n\n"
+            val number = slide.screenshotNumber.takeIf { it > 0 } ?: index + 1
+            val section = "[Screenshot $number OCR]\n$chunk\n\n"
             out.append(section)
             remaining -= chunk.length
         }

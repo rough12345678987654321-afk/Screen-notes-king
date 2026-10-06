@@ -44,6 +44,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import coil.compose.AsyncImage
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -517,9 +518,20 @@ fun Detail(id: Long, onBack: () -> Unit) {
     var pdfBusy by remember { mutableStateOf(false) }
     var zoomPath by remember { mutableStateOf<String?>(null) }
 
-    // Captured slides keyed by the [Screenshot N] number used in notes and PDF exports.
-    val shotData = remember(shots) {
-        shots.mapIndexedNotNull { index, shot ->
+    // Load full images only for the HTML/PDF view; note generation uses file-backed slides and loads
+    // at most the selected vision images, so a 100+ shot session does not duplicate every byte.
+    // The map stays in memory for a short while after leaving that view so PDF export still works.
+    var pdfWarm by remember { mutableStateOf(previewMode == "html") }
+    LaunchedEffect(previewMode) {
+        if (previewMode == "html") {
+            pdfWarm = true
+        } else {
+            delay(8000)
+            pdfWarm = false
+        }
+    }
+    val shotData = remember(shots, previewMode, pdfWarm) {
+        if (previewMode != "html" && !pdfWarm) emptyMap() else shots.mapIndexedNotNull { index, shot ->
             runCatching { File(shot.path).readBytes() }.getOrNull()?.let { bytes -> (index + 1) to bytes }
         }.toMap()
     }
@@ -585,8 +597,8 @@ fun Detail(id: Long, onBack: () -> Unit) {
         scope.launch {
             val result = withContext(Dispatchers.IO) {
                 runCatching {
-                    val slideList = shots.map { shot ->
-                        Slide(shot.ocrText, runCatching { File(shot.path).readBytes() }.getOrNull())
+                    val slideList = shots.mapIndexed { index, shot ->
+                        Slide(shot.ocrText, null, index + 1, File(shot.path))
                     }
                     val keys = AiNotesEngine.readKeys(prefs)
                     val instructions = prefs.getString(AiNotesEngine.PREF_AI_INSTRUCTIONS, "") ?: ""
@@ -607,8 +619,8 @@ fun Detail(id: Long, onBack: () -> Unit) {
             busy = true
             val result = withContext(Dispatchers.IO) {
                 runCatching {
-                    val slideList = shots.map { shot ->
-                        Slide(shot.ocrText, runCatching { File(shot.path).readBytes() }.getOrNull())
+                    val slideList = shots.mapIndexed { index, shot ->
+                        Slide(shot.ocrText, null, index + 1, File(shot.path))
                     }
                     val keys = AiNotesEngine.readKeys(prefs)
                     val instructions = prefs.getString(AiNotesEngine.PREF_AI_INSTRUCTIONS, "") ?: ""
