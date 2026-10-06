@@ -54,6 +54,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
 import java.text.DateFormat
 import java.util.Date
 
@@ -64,6 +66,33 @@ fun geminiKeys(prefs: android.content.SharedPreferences): List<String> =
 /** The model the owner picked for notes (default when nothing picked yet). */
 fun geminiModel(prefs: android.content.SharedPreferences): String =
     prefs.getString("model", "")?.takeIf { it.isNotBlank() } ?: Gemini.DEFAULT_MODEL
+
+/** Matches the file id in any shareable Google Drive file link. */
+val DRIVE_FILE_ID = Regex("""(?:drive\.google\.com/(?:file/d/|open\?id=|uc\?id=)|[?&]id=)([-\w]{10,})""")
+
+/** Reads up to 50 pages of a PDF into a new session's screenshots - on-device, zero API quota. */
+suspend fun importPdfPages(ctx: Context, dao: NoteDao, open: () -> ParcelFileDescriptor?): Long? =
+    withContext(Dispatchers.IO) {
+        val pfd = open() ?: return@withContext null
+        val renderer = PdfRenderer(pfd)
+        val title = "PDF " + java.text.SimpleDateFormat("d MMM, HH:mm", java.util.Locale.getDefault())
+            .format(java.util.Date())
+        val nId = dao.insertNote(Note(title = title, createdAt = System.currentTimeMillis()))
+        val shotsDir = File(ctx.filesDir, "shots/$nId").apply { mkdirs() }
+        val pageCount = minOf(renderer.pageCount, 50)
+        for (i in 0 until pageCount) {
+            val page = renderer.openPage(i)
+            val bmp = Bitmap.createBitmap(1280, (1280f * page.height / page.width).toInt(), Bitmap.Config.ARGB_8888)
+            page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+            page.close()
+            val file = File(shotsDir, "${i * 1000L}.jpg")
+            file.outputStream().use { bmp.compress(Bitmap.CompressFormat.JPEG, 90, it) }
+            dao.insertShot(Shot(noteId = nId, path = file.absolutePath, ocrText = "PDF page ${i + 1}", timeMs = i * 1000L))
+        }
+        renderer.close()
+        pfd.close()
+        nId
+    }
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -146,12 +175,18 @@ fun Home(onOpen: (Long) -> Unit) {
     val scope = rememberCoroutineScope()
     val prefs = remember { ctx.getSharedPreferences("p", Context.MODE_PRIVATE) }
     var key by remember { mutableStateOf(prefs.getString("key", "") ?: "") }
+    var pendingUrl by remember { mutableStateOf("") }
 
     val launcher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
         if (r.resultCode == Activity.RESULT_OK && r.data != null) {
             ctx.startForegroundService(
                 Intent(ctx, CaptureService::class.java).putExtra("code", r.resultCode).putExtra("data", r.data)
             )
+            val url = pendingUrl
+            if (url.isNotBlank()) {
+                pendingUrl = ""
+                runCatching { ctx.startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url))) }
+            }
         }
     }
 
@@ -204,30 +239,10 @@ fun Home(onOpen: (Long) -> Unit) {
                 importStatus = "Importing PDF pages..."
                 scope.launch(Dispatchers.IO) {
                     try {
-                        val pfd = ctx.contentResolver.openFileDescriptor(uri, "r")
-                        if (pfd != null) {
-                            val renderer = PdfRenderer(pfd)
-                            val title = "PDF " + java.text.SimpleDateFormat("d MMM, HH:mm", java.util.Locale.getDefault()).format(java.util.Date())
-                            val nId = dao.insertNote(Note(title = title, createdAt = System.currentTimeMillis()))
-                            val shotsDir = File(ctx.filesDir, "shots/$nId").apply { mkdirs() }
-                            
-                            val pageCount = minOf(renderer.pageCount, 50)
-                            for (i in 0 until pageCount) {
-                                val page = renderer.openPage(i)
-                                val bmp = Bitmap.createBitmap(1280, (1280f * page.height / page.width).toInt(), Bitmap.Config.ARGB_8888)
-                                page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-                                page.close()
-                                
-                                val file = File(shotsDir, "${i * 1000L}.jpg")
-                                file.outputStream().use { bmp.compress(Bitmap.CompressFormat.JPEG, 90, it) }
-                                dao.insertShot(Shot(noteId = nId, path = file.absolutePath, ocrText = "PDF page ${i+1}", timeMs = i * 1000L))
-                            }
-                            renderer.close()
-                            pfd.close()
-                            withContext(Dispatchers.Main) {
-                                importing = false
-                                onOpen(nId)
-                            }
+                        val nId = importPdfPages(ctx, dao) { ctx.contentResolver.openFileDescriptor(uri, "r") }
+                        withContext(Dispatchers.Main) {
+                            importing = false
+                            if (nId != null) onOpen(nId) else importStatus = "Could not open that file."
                         }
                     } catch (e: Exception) {
                         withContext(Dispatchers.Main) {
@@ -253,7 +268,7 @@ fun Home(onOpen: (Long) -> Unit) {
             OutlinedTextField(
                 value = urlInput,
                 onValueChange = { urlInput = it },
-                label = { Text("YouTube / Drive / Web link") },
+                label = { Text("Drive PDF link, or any video/web link to capture") },
                 modifier = Modifier.weight(1f),
                 singleLine = true
             )
@@ -262,35 +277,57 @@ fun Home(onOpen: (Long) -> Unit) {
                 onClick = {
                     val link = urlInput.trim()
                     urlInput = ""
-                    importing = true
-                    importStatus = "Processing link..."
-                    scope.launch(Dispatchers.IO) {
-                        try {
-                            val title = "Link Note " + java.text.SimpleDateFormat("d MMM, HH:mm", java.util.Locale.getDefault()).format(java.util.Date())
-                            val nId = dao.insertNote(Note(title = title, createdAt = System.currentTimeMillis()))
-                            val shotsDir = File(ctx.filesDir, "shots/$nId").apply { mkdirs() }
-                            
-                            // If it's YouTube or web article / drive, extract key info or generate summary note via Gemini directly or via simulated snapshots
-                            val prompt = "Create comprehensive structured study notes with explanations, formulas and key points from this link or topic: $link"
-                            val res = Gemini.makeNotes(geminiKeys(prefs), listOf(Slide(prompt, null)), geminiModel(prefs))
-                            val notes = res.text
-                            
-                            dao.updateNote(dao.noteOnce(nId)?.copy(aiNotes = notes) ?: Note(id = nId, title = title, createdAt = System.currentTimeMillis(), aiNotes = notes))
-                            
-                            withContext(Dispatchers.Main) {
-                                importing = false
-                                onOpen(nId)
-                            }
-                        } catch (e: Exception) {
-                            withContext(Dispatchers.Main) {
-                                importing = false
-                                importStatus = "Error: ${e.message}"
+                    val driveId = DRIVE_FILE_ID.find(link)?.groupValues?.get(1)
+                    if (driveId != null) {
+                        importing = true
+                        importStatus = "Downloading from Drive..."
+                        scope.launch(Dispatchers.IO) {
+                            try {
+                                val conn = URL("https://drive.google.com/uc?export=download&id=$driveId")
+                                    .openConnection() as HttpURLConnection
+                                conn.instanceFollowRedirects = true
+                                conn.connectTimeout = 20000
+                                conn.readTimeout = 60000
+                                val f = File(ctx.cacheDir, "drive-$driveId.pdf")
+                                f.outputStream().use { out -> conn.inputStream.use { it.copyTo(out) } }
+                                val magic = ByteArray(5)
+                                f.inputStream().use { it.read(magic) }
+                                if (String(magic, Charsets.US_ASCII) == "%PDF-") {
+                                    importStatus = "Importing PDF pages..."
+                                    val nId = importPdfPages(ctx, dao) {
+                                        ParcelFileDescriptor.open(f, ParcelFileDescriptor.MODE_READ_ONLY)
+                                    }
+                                    withContext(Dispatchers.Main) {
+                                        importing = false
+                                        if (nId != null) onOpen(nId)
+                                        else importStatus = "Could not open that PDF."
+                                    }
+                                } else {
+                                    f.delete()
+                                    withContext(Dispatchers.Main) {
+                                        importing = false
+                                        importStatus = "That Drive link is not a public PDF file. " +
+                                            "For videos and web pages, put the link here and capture instead."
+                                    }
+                                }
+                            } catch (e: Exception) {
+                                withContext(Dispatchers.Main) {
+                                    importing = false
+                                    importStatus = "Drive download failed: ${e.message}"
+                                }
                             }
                         }
+                    } else {
+                        // YouTube / any other site: videos cannot be downloaded - capture them instead.
+                        pendingUrl = link
+                        importStatus = "Accept the capture prompt - your link opens right after, " +
+                            "and slides are captured while you watch."
+                        val mpm = ctx.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                        launcher.launch(mpm.createScreenCaptureIntent())
                     }
                 }
             ) {
-                Text("Process Link")
+                Text("Import / Capture")
             }
         }
         if (importing && !importStatus.contains("PDF")) {
