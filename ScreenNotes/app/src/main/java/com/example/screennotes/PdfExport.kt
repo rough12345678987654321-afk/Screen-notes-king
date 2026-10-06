@@ -10,53 +10,98 @@ import android.graphics.Paint
 import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.pdf.PdfDocument
+import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 import android.text.StaticLayout
 import android.text.TextPaint
+import androidx.core.content.FileProvider
 import java.io.File
+import java.io.FileOutputStream
+
+/** The completed file's content URI and visible Downloads path. */
+data class PdfSaveResult(val uri: Uri, val path: String)
 
 /**
- * Writes the notes to a real PDF file in Downloads/ScreenNotes - no print dialog and no
- * print-framework support needed (the owner's tablet answered "not supported" to the print
- * dialog). Renders the Markdown blocks and the captured slides straight onto PDF pages.
+ * Builds and writes a PDF directly to Downloads/ScreenNotes with PdfDocument. Call from an IO
+ * dispatcher; there is deliberately no Android print framework or print dialog involved.
  */
 object PdfExport {
-
     private const val PAGE_W = 595f // A4 in points
     private const val PAGE_H = 842f
     private const val MARGIN = 40f
+    private const val AUTHORITY_SUFFIX = ".files"
 
-    /** [images] maps the [Screenshot N] numbers to the captured JPEG bytes. */
+    /** [images] maps [Screenshot N] references to the original captured JPEG bytes. */
     fun save(
         ctx: Context,
         fileName: String,
         md: String,
         title: String,
-        images: Map<Int, ByteArray>,
-        onDone: (msg: String?, err: String?) -> Unit
-    ) {
+        images: Map<Int, ByteArray>
+    ): PdfSaveResult {
+        require(md.isNotBlank()) { "There are no notes to export yet. Generate or write notes first." }
+        val safeMd = NotesClean.cleanNotes(md)
+        val doc = PdfDocument()
+        var insertedUri: Uri? = null
         try {
-            val doc = PdfDocument()
             val pager = Pager(doc)
             pager.startPage()
             pager.y += 8f
             pager.layout(title, 20f, bold = true, spaceAfter = 14f)
-            for (b in parseBlocks(md)) pager.block(b, images)
+            for (block in parseBlocks(safeMd)) pager.block(block, images)
             pager.finishPage()
-            val tmp = File(ctx.cacheDir, fileName)
-            val out = tmp.outputStream()
-            doc.writeTo(out)
-            out.close()
-            doc.close()
-            onDone(publish(ctx, tmp, fileName), null)
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val values = ContentValues().apply {
+                    put(MediaStore.Downloads.DISPLAY_NAME, fileName)
+                    put(MediaStore.Downloads.MIME_TYPE, "application/pdf")
+                    put(MediaStore.Downloads.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/ScreenNotes")
+                    put(MediaStore.Downloads.IS_PENDING, 1)
+                }
+                val uri = ctx.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                    ?: error("Android could not create a file in Downloads/ScreenNotes.")
+                insertedUri = uri
+                val output = ctx.contentResolver.openOutputStream(uri, "w")
+                    ?: error("Android could not open the new PDF file.")
+                output.use { doc.writeTo(it) }
+                val published = ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) }
+                ctx.contentResolver.update(uri, published, null, null)
+                return PdfSaveResult(uri, "Downloads/ScreenNotes/$fileName")
+            }
+
+            @Suppress("DEPRECATION")
+            val downloads = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+            val folder = File(downloads, "ScreenNotes")
+            if (!folder.exists() && !folder.mkdirs()) error("Could not create Downloads/ScreenNotes.")
+            val target = uniqueFile(folder, fileName)
+            FileOutputStream(target).use { doc.writeTo(it) }
+            val uri = FileProvider.getUriForFile(
+                ctx, ctx.packageName + AUTHORITY_SUFFIX, target
+            )
+            return PdfSaveResult(uri, "Downloads/ScreenNotes/${target.name}")
         } catch (e: Exception) {
-            onDone(null, e.message ?: "PDF failed")
+            insertedUri?.let { runCatching { ctx.contentResolver.delete(it, null, null) } }
+            throw e
+        } finally {
+            doc.close()
         }
     }
 
-    /** One A4 page at a time; blocks that do not fit flow onto the next page. */
+    private fun uniqueFile(folder: File, requested: String): File {
+        val original = File(folder, requested)
+        if (!original.exists()) return original
+        val stem = requested.removeSuffix(".pdf")
+        var suffix = 2
+        while (true) {
+            val candidate = File(folder, "$stem ($suffix).pdf")
+            if (!candidate.exists()) return candidate
+            suffix++
+        }
+    }
+
+    /** One A4 page at a time; blocks that do not fit flow to the next page. */
     private class Pager(private val doc: PdfDocument) {
         var y = MARGIN
         private var pageNo = 0
@@ -81,8 +126,8 @@ object PdfExport {
             canvas = null
         }
 
-        private fun ensureSpace(h: Float) {
-            if (y + h > PAGE_H - MARGIN) {
+        private fun ensureSpace(height: Float) {
+            if (y + height > PAGE_H - MARGIN) {
                 finishPage()
                 startPage()
             }
@@ -102,43 +147,50 @@ object PdfExport {
             paint.isFakeBoldText = bold
             paint.typeface = if (mono) Typeface.MONOSPACE else Typeface.DEFAULT
             paint.color = color
-            val sl = StaticLayout.Builder.obtain(text, 0, text.length, paint, contentW)
+            val layout = StaticLayout.Builder.obtain(text, 0, text.length, paint, contentW)
                 .setLineSpacing(0f, 1.25f).build()
-            ensureSpace(sl.height.toFloat() + spaceAfter)
-            val c = canvas!!
+            ensureSpace(layout.height.toFloat() + spaceAfter)
+            val currentCanvas = canvas!!
             if (bg) {
                 bgPaint.color = Color.parseColor("#f2f2f2")
-                c.drawRect(MARGIN - 6f, y - 4f, PAGE_W - MARGIN + 6f, y + sl.height + 4f, bgPaint)
+                currentCanvas.drawRect(MARGIN - 6f, y - 4f, PAGE_W - MARGIN + 6f, y + layout.height + 4f, bgPaint)
             }
-            c.save()
-            c.translate(MARGIN, y)
-            sl.draw(c)
-            c.restore()
-            y += sl.height + spaceAfter
+            currentCanvas.save()
+            currentCanvas.translate(MARGIN, y)
+            layout.draw(currentCanvas)
+            currentCanvas.restore()
+            y += layout.height + spaceAfter
         }
 
         fun image(bytes: ByteArray, spaceAfter: Float = 12f) {
-            val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return
-            val scale = contentW / bmp.width.toFloat()
-            val h = bmp.height * scale
-            ensureSpace(h + spaceAfter)
-            canvas!!.drawBitmap(bmp, null, RectF(MARGIN, y, MARGIN + contentW, y + h), null)
-            y += h + spaceAfter
-            bmp.recycle()
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return
+            var sample = 1
+            while (bounds.outWidth / (sample * 2) >= contentW * 2) sample *= 2
+            val bitmap = BitmapFactory.decodeByteArray(
+                bytes, 0, bytes.size, BitmapFactory.Options().apply { inSampleSize = sample }
+            ) ?: return
+            val scale = minOf(contentW / bitmap.width.toFloat(), (PAGE_H - 2 * MARGIN) / bitmap.height.toFloat())
+            val width = bitmap.width * scale
+            val height = bitmap.height * scale
+            ensureSpace(height + spaceAfter)
+            canvas!!.drawBitmap(bitmap, null, RectF(MARGIN, y, MARGIN + width, y + height), null)
+            y += height + spaceAfter
+            bitmap.recycle()
         }
 
-        /** Draws one Markdown block; [Screenshot N] inside it becomes the actual slide. */
-        fun block(b: MdBlock, images: Map<Int, ByteArray>) {
-            when (b) {
+        fun block(block: MdBlock, images: Map<Int, ByteArray>) {
+            when (block) {
                 is MdBlock.Heading -> {
                     y += 6f
-                    withImages(b.text, when (b.level) { 1 -> 18f; 2 -> 15f; else -> 13f }, bold = true, images)
+                    withImages(block.text, when (block.level) { 1 -> 18f; 2 -> 15f; else -> 13f }, true, images)
                     y += 4f
                 }
-                is MdBlock.Para -> withImages(b.text, 11f, bold = false, images = images)
-                is MdBlock.Bullet -> withImages("${b.marker} ${b.text}", 11f, bold = false, images = images)
-                is MdBlock.Code -> layout(b.text, 9f, bold = false, mono = true, bg = true)
-                is MdBlock.Quote -> withImages(b.text, 11f, bold = false, color = Color.GRAY, images = images)
+                is MdBlock.Para -> withImages(block.text, 11f, false, images = images)
+                is MdBlock.Bullet -> withImages("${block.marker} ${block.text}", 11f, false, images = images)
+                is MdBlock.Code -> layout(block.text, 9f, bold = false, mono = true, bg = true)
+                is MdBlock.Quote -> withImages(block.text, 11f, false, color = Color.GRAY, images = images)
                 MdBlock.Rule -> {
                     ensureSpace(14f)
                     bgPaint.color = Color.LTGRAY
@@ -149,7 +201,7 @@ object PdfExport {
             }
         }
 
-        private val SHOT_REF = Regex("""\[Screenshot (\d+)]""")
+        private val screenshotRef = Regex("""\[Screenshot (\d+)]""")
 
         private fun withImages(
             text: String,
@@ -158,35 +210,13 @@ object PdfExport {
             images: Map<Int, ByteArray>,
             color: Int = Color.BLACK
         ) {
-            var pos = 0
-            for (m in SHOT_REF.findAll(text)) {
-                if (m.range.first > pos) layout(text.substring(pos, m.range.first), size, bold, color = color)
-                images[m.groupValues[1].toIntOrNull() ?: -1]?.let { image(it) }
-                pos = m.range.last + 1
+            var position = 0
+            for (match in screenshotRef.findAll(text)) {
+                if (match.range.first > position) layout(text.substring(position, match.range.first), size, bold, color = color)
+                images[match.groupValues[1].toIntOrNull() ?: -1]?.let { image(it) }
+                position = match.range.last + 1
             }
-            if (pos < text.length) layout(text.substring(pos), size, bold, color = color)
+            if (position < text.length) layout(text.substring(position), size, bold, color = color)
         }
-    }
-
-    /** Copies the finished PDF into the public Downloads folder (Android 10+), no permission needed. */
-    private fun publish(ctx: Context, tmp: File, fileName: String): String {
-        if (Build.VERSION.SDK_INT >= 29) {
-            return try {
-                val values = ContentValues().apply {
-                    put(MediaStore.Downloads.DISPLAY_NAME, fileName)
-                    put(MediaStore.Downloads.MIME_TYPE, "application/pdf")
-                    put(MediaStore.Downloads.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/ScreenNotes")
-                }
-                val uri = ctx.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-                    ?: return "PDF ready, but Downloads refused it - use Share / Export instead."
-                ctx.contentResolver.openOutputStream(uri)?.use { out ->
-                    tmp.inputStream().use { it.copyTo(out) }
-                }
-                "Saved: Downloads/ScreenNotes/$fileName"
-            } catch (e: Exception) {
-                "PDF ready, but copying to Downloads failed: ${e.message}"
-            }
-        }
-        return "PDF ready inside the app (Android 9 keeps it private) - use Share / Export to send it."
     }
 }

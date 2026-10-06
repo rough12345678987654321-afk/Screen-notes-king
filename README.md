@@ -1,7 +1,8 @@
 # Screen Notes
 
 My personal Android app for JEE preparation. It captures lecture screens and turns them into
-clean study notes with Gemini. The app's code is in [`ScreenNotes/`](ScreenNotes/), and the
+clean study notes with a 24-model, multi-provider AI engine (including Gemini vision and keyless
+fallback). The app's code is in [`ScreenNotes/`](ScreenNotes/), and the
 [guide](ScreenNotes/README.md) covers installing and using it.
 
 The app can also **update itself with AI**. Describe a change in the app's **Updates** tab, and

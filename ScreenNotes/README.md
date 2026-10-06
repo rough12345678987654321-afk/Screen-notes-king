@@ -1,12 +1,14 @@
 # Screen Notes: guide
 
 An Android app that watches your screen during a lecture or video. Each time the slide changes
-and settles, it saves a screenshot and reads the text on it. Then it turns everything into clean
-notes with Gemini AI.
+and settles, it saves a screenshot and reads the text on it. It turns the captured screenshots and
+OCR into clean study notes using a 24-model, multi-provider AI ladder.
 
 ## What you need (all free)
 1. Your Android tablet/phone.
-2. A free Gemini API key for the notes: https://aistudio.google.com/apikey
+2. Any AI provider key you want to use (optional). Pollinations is a keyless fallback; Gemini,
+   OpenRouter, Groq, Cerebras, NVIDIA, HuggingFace, Mistral, and GitHub Models keys are entered
+   and kept only on your device.
 3. This GitHub repository. GitHub builds the app for you, so **no computer or Android Studio is needed**.
 
 ## Install
@@ -19,13 +21,23 @@ After that, update from inside the app: **Updates** tab → **Install latest ver
 install over the old app and keep all your notes.
 
 ## Using it
-1. Paste your Gemini API key on the Notes tab (it's saved on your device).
-2. Tap **Start capturing** and accept Android's screen-recording prompt.
-3. Open your lecture / video. Leave it running.
-4. When done, pull down the notification and tap **Stop**, or reopen the app and tap Stop.
-5. Open the session from History to see the screenshots and extracted text. Tap
-   **Make AI notes**, edit, then Save / Share.
-6. Delete a whole session or a single screenshot with the Delete buttons.
+1. On the Notes tab, expand **AI sources** and paste any provider keys you have. The existing
+   Gemini key is kept automatically; Pollinations works without a key. Tap **Test** beside a key
+   to check it. Top tier becomes the default when at least two provider families are ready.
+2. Choose **Top tier when possible** for two independent AI drafts plus an evidence-checked merge,
+   or **Fast (one AI)** for one response with automatic provider fallback.
+3. Tap **Start capturing** and accept Android's screen-recording prompt.
+4. Open your lecture / video. Leave it running.
+5. When done, pull down the notification and tap **Stop**, or reopen the app and tap Stop.
+6. Open the session from History to see the screenshots and extracted text. Tap **Make AI notes**,
+   edit, then Save / Share. Gemini receives screenshots; the other providers receive OCR text.
+7. Use **Save as PDF** to write directly to `Downloads/ScreenNotes/` and open the saved file.
+   Export is unavailable until the notes contain text.
+8. Delete a whole session or a single screenshot with the Delete buttons.
+
+The source card covers 24 models across Gemini (2), OpenRouter (5), Groq (3), Cerebras (2),
+NVIDIA (2), HuggingFace (3), Mistral (2), GitHub Models (2), and keyless Pollinations (3).
+Store one key per keyed provider family; that one key is shared by its listed models.
 
 ## Changing the app: the Updates tab
 You don't need to code. Describe what you want and the AI does it on GitHub:
