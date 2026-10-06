@@ -81,7 +81,8 @@ SCREENSHOTS:
     /** Downscale + recompress one screenshot so the free quota lasts longer. */
     fun shrinkForUpload(jpeg: ByteArray): ByteArray = shrink(jpeg)
 
-    private fun shrink(jpeg: ByteArray): ByteArray = try {
+    private fun shrink(jpeg: ByteArray): ByteArray {
+        return try {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size, bounds)
         if (bounds.outWidth <= 0) return jpeg
@@ -101,8 +102,9 @@ SCREENSHOTS:
         bmp.compress(Bitmap.CompressFormat.JPEG, IMG_QUALITY, out)
         bmp.recycle()
         out.toByteArray()
-    } catch (e: Exception) {
-        jpeg
+        } catch (e: Exception) {
+            jpeg
+        }
     }
 
     /**

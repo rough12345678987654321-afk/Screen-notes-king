@@ -2,104 +2,164 @@ package com.example.screennotes
 
 import android.content.ContentValues
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.RectF
+import android.graphics.Typeface
+import android.graphics.pdf.PdfDocument
 import android.os.Build
-import android.os.Bundle
-import android.os.CancellationSignal
 import android.os.Environment
-import android.os.ParcelFileDescriptor
-import android.print.PrintAttributes
-import android.print.PrintDocumentAdapter
-import android.print.PrintDocumentInfo
-import android.print.PageRange
 import android.provider.MediaStore
-import android.view.View
-import android.webkit.WebView
-import android.webkit.WebViewClient
+import android.text.StaticLayout
 import java.io.File
 
 /**
- * Renders the notes HTML into a real PDF file and puts it in Downloads/ScreenNotes.
- * No print dialog and no print-framework support needed (the owner's tablet said
- * "not supported" about the print dialog), because the WebView print adapter is
- * driven straight into a file here.
+ * Writes the notes to a real PDF file in Downloads/ScreenNotes - no print dialog and no
+ * print-framework support needed (the owner's tablet answered "not supported" to the print
+ * dialog). Renders the Markdown blocks and the captured slides straight onto PDF pages.
  */
 object PdfExport {
 
-    /** A4 at 96 dpi: the page size the off-screen WebView is laid out at. */
-    private const val PAGE_W = 794
-    private const val PAGE_H = 1123
+    private const val PAGE_W = 595f // A4 in points
+    private const val PAGE_H = 842f
+    private const val MARGIN = 40f
 
-    fun save(ctx: Context, fileName: String, html: String, onDone: (msg: String?, err: String?) -> Unit) {
+    /** [images] maps the [Screenshot N] numbers to the captured JPEG bytes. */
+    fun save(
+        ctx: Context,
+        fileName: String,
+        md: String,
+        title: String,
+        images: Map<Int, ByteArray>,
+        onDone: (msg: String?, err: String?) -> Unit
+    ) {
         try {
-            val webView = WebView(ctx)
-            webView.settings.javaScriptEnabled = false
-            webView.webViewClient = object : WebViewClient() {
-                override fun onPageFinished(view: WebView, url: String?) {
-                    view.post { render(ctx, view, fileName, onDone) }
+            val doc = PdfDocument()
+            val pager = Pager(doc)
+            pager.startPage()
+            pager.y += 8f
+            pager.layout(title, 20f, bold = true, spaceAfter = 14f)
+            for (b in parseBlocks(md)) pager.block(b, images)
+            pager.finishPage()
+            val tmp = File(ctx.cacheDir, fileName)
+            tmp.outputStream().use { doc.write(it) }
+            doc.close()
+            onDone(publish(ctx, tmp, fileName), null)
+        } catch (e: Exception) {
+            onDone(null, e.message ?: "PDF failed")
+        }
+    }
+
+    /** One A4 page at a time; blocks that do not fit flow onto the next page. */
+    private class Pager(private val doc: PdfDocument) {
+        var y = MARGIN
+        private var page: PdfDocument.Page? = null
+        private var canvas: Canvas? = null
+        private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+        private val bgPaint = Paint()
+        private val contentW = (PAGE_W - 2 * MARGIN).toInt()
+
+        fun startPage() {
+            page = doc.startPage(
+                PdfDocument.PageInfo.Builder(PAGE_W.toInt(), PAGE_H.toInt(), doc.pageCount + 1).create()
+            )
+            canvas = page!!.canvas
+            y = MARGIN
+        }
+
+        fun finishPage() {
+            page?.let { doc.finishPage(it) }
+            page = null
+            canvas = null
+        }
+
+        private fun ensureSpace(h: Float) {
+            if (y + h > PAGE_H - MARGIN) {
+                finishPage()
+                startPage()
+            }
+        }
+
+        fun layout(
+            text: String,
+            size: Float,
+            bold: Boolean,
+            mono: Boolean = false,
+            color: Int = Color.BLACK,
+            bg: Boolean = false,
+            spaceAfter: Float = 7f
+        ) {
+            if (text.isEmpty()) return
+            paint.textSize = size
+            paint.isFakeBoldText = bold
+            paint.typeface = if (mono) Typeface.MONOSPACE else Typeface.DEFAULT
+            paint.color = color
+            val sl = StaticLayout.Builder.obtain(text, 0, text.length, paint, contentW)
+                .setLineSpacing(0f, 1.25f).build()
+            ensureSpace(sl.height.toFloat() + spaceAfter)
+            val c = canvas!!
+            if (bg) {
+                bgPaint.color = Color.parseColor("#f2f2f2")
+                c.drawRect(MARGIN - 6f, y - 4f, PAGE_W - MARGIN + 6f, y + sl.height + 4f, bgPaint)
+            }
+            c.save()
+            c.translate(MARGIN, y)
+            sl.draw(c)
+            c.restore()
+            y += sl.height + spaceAfter
+        }
+
+        fun image(bytes: ByteArray, spaceAfter: Float = 12f) {
+            val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return
+            val scale = contentW / bmp.width.toFloat()
+            val h = bmp.height * scale
+            ensureSpace(h + spaceAfter)
+            canvas!!.drawBitmap(bmp, null, RectF(MARGIN, y, MARGIN + contentW, y + h), null)
+            y += h + spaceAfter
+            bmp.recycle()
+        }
+
+        /** Draws one Markdown block; [Screenshot N] inside it becomes the actual slide. */
+        fun block(b: MdBlock, images: Map<Int, ByteArray>) {
+            when (b) {
+                is MdBlock.Heading -> {
+                    y += 6f
+                    withImages(b.text, when (b.level) { 1 -> 18f; 2 -> 15f; else -> 13f }, bold = true, images)
+                    y += 4f
+                }
+                is MdBlock.Para -> withImages(b.text, 11f, bold = false, images = images)
+                is MdBlock.Bullet -> withImages("${b.marker} ${b.text}", 11f, bold = false, images = images)
+                is MdBlock.Code -> layout(b.text, 9f, bold = false, mono = true, bg = true)
+                is MdBlock.Quote -> withImages(b.text, 11f, bold = false, color = Color.GRAY, images = images)
+                MdBlock.Rule -> {
+                    ensureSpace(14f)
+                    bgPaint.color = Color.LTGRAY
+                    bgPaint.strokeWidth = 1f
+                    canvas!!.drawLine(MARGIN, y, PAGE_W - MARGIN, y, bgPaint)
+                    y += 14f
                 }
             }
-            webView.loadDataWithBaseURL(null, html, "text/html", "UTF-8", null)
-        } catch (e: Exception) {
-            onDone(null, e.message ?: "WebView failed")
         }
-    }
 
-    private fun render(ctx: Context, view: WebView, fileName: String, onDone: (String?, String?) -> Unit) {
-        try {
-            view.measure(
-                View.MeasureSpec.makeMeasureSpec(PAGE_W, View.MeasureSpec.EXACTLY),
-                View.MeasureSpec.makeMeasureSpec(PAGE_H, View.MeasureSpec.EXACTLY)
-            )
-            view.layout(0, 0, PAGE_W, PAGE_H)
-            val adapter = view.createPrintDocumentAdapter(fileName)
-            val attrs = PrintAttributes.Builder()
-                .setMediaSize(PrintAttributes.MediaSize.ISO_A4)
-                .setResolution(PrintAttributes.Resolution("pdf", "screennotes", 72, 72))
-                .setColorMode(PrintAttributes.COLOR_MODE_COLOR)
-                .build()
-            adapter.onLayout(null, attrs, CancellationSignal(), object : PrintDocumentAdapter.LayoutResultCallback() {
-                override fun onLayoutFinished(info: PrintDocumentInfo?, changed: Boolean) {
-                    writeToFile(ctx, adapter, fileName, onDone)
-                }
+        private val SHOT_REF = Regex("""\[Screenshot (\d+)]""")
 
-                override fun onLayoutFailed(error: CharSequence?) {
-                    onDone(null, error?.toString() ?: "PDF layout failed")
-                }
-            }, Bundle())
-        } catch (e: Exception) {
-            onDone(null, e.message ?: "PDF render failed")
-        }
-    }
-
-    private fun writeToFile(
-        ctx: Context,
-        adapter: PrintDocumentAdapter,
-        fileName: String,
-        onDone: (String?, String?) -> Unit
-    ) {
-        val tmp = File(ctx.cacheDir, fileName)
-        try {
-            val pfd = ParcelFileDescriptor.open(
-                tmp,
-                ParcelFileDescriptor.MODE_CREATE or ParcelFileDescriptor.MODE_TRUNCATE or
-                    ParcelFileDescriptor.MODE_READ_WRITE
-            )
-            adapter.onWrite(
-                arrayOf(PageRange.ALL_PAGES), pfd, CancellationSignal(),
-                object : PrintDocumentAdapter.WriteResultCallback() {
-                    override fun onWriteFinished(pages: Array<out PageRange>?) {
-                        pfd.close()
-                        onDone(publish(ctx, tmp, fileName), null)
-                    }
-
-                    override fun onWriteFailed(error: CharSequence?) {
-                        pfd.close()
-                        onDone(null, error?.toString() ?: "PDF write failed")
-                    }
-                }
-            )
-        } catch (e: Exception) {
-            onDone(null, e.message ?: "PDF write failed")
+        private fun withImages(
+            text: String,
+            size: Float,
+            bold: Boolean,
+            images: Map<Int, ByteArray>,
+            color: Int = Color.BLACK
+        ) {
+            var pos = 0
+            for (m in SHOT_REF.findAll(text)) {
+                if (m.range.first > pos) layout(text.substring(pos, m.range.first), size, bold, color = color)
+                images[m.groupValues[1].toIntOrNull() ?: -1]?.let { image(it) }
+                pos = m.range.last + 1
+            }
+            if (pos < text.length) layout(text.substring(pos), size, bold, color = color)
         }
     }
 

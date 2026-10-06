@@ -379,20 +379,22 @@ fun Detail(id: Long, onBack: () -> Unit) {
     var pdfMsg by remember { mutableStateOf("") }
     var zoomPath by remember { mutableStateOf<String?>(null) }
 
-    // base64 of every captured slide (downscaled), keyed by the [Screenshot N] number
-    val shotImages = remember(shots) {
+    // captured slides keyed by their [Screenshot N] number: raw bytes for the PDF...
+    val shotData = remember(shots) {
         shots.mapIndexedNotNull { i, sh ->
-            runCatching { File(sh.path).readBytes() }.getOrNull()
-                ?.let { b -> (i + 1) to Base64.encodeToString(Gemini.shrinkForUpload(b), Base64.NO_WRAP) }
+            runCatching { File(sh.path).readBytes() }.getOrNull()?.let { b -> (i + 1) to b }
         }.toMap()
+    }
+    // ...and downscaled base64 for the HTML view
+    val shotImages = remember(shotData) {
+        shotData.mapValues { Base64.encodeToString(Gemini.shrinkForUpload(it.value), Base64.NO_WRAP) }
     }
     val savePdf: () -> Unit = {
         pdfBusy = true
         pdfMsg = "Making PDF..."
-        val html = markdownToHtml(note?.title ?: "Study Notes", text, shotImages)
         val name = ((note?.title ?: "ScreenNotes").replace(Regex("[^A-Za-z0-9 -]"), "").trim().take(40)
             .ifBlank { "ScreenNotes" }) + ".pdf"
-        PdfExport.save(ctx, name, html) { msg, err ->
+        PdfExport.save(ctx, name, text, note?.title ?: "Study Notes", shotData) { msg, err ->
             pdfBusy = false
             pdfMsg = msg ?: ("PDF failed: $err")
         }
