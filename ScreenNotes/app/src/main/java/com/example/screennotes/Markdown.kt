@@ -199,7 +199,7 @@ fun markdownToHtml(title: String, md: String, images: Map<Int, String> = emptyMa
 /** Replaces [Screenshot N] references with the actual captured slide, so the notes and the PDF show what the teacher drew. */
 private fun embedImages(escaped: String, images: Map<Int, String>): String {
     if (images.isEmpty()) return escaped
-    return Regex("""\[Screenshot (\d+)\]\"\"\").replace(escaped) { m ->
+    return Regex("""\[Screenshot (\d+)\]""").replace(escaped) { m ->
         val n = m.groupValues[1].toIntOrNull() ?: return@replace m.value
         val b64 = images[n] ?: return@replace m.value
         "<figure><img class=\"shot\" src=\"data:image/jpeg;base64,$b64\" alt=\"Screenshot $n\"/>" +
