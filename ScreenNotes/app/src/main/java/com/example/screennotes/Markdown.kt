@@ -157,16 +157,16 @@ private fun AnnotatedString.Builder.appendInline(s: String, link: Color, codeBg:
 fun inlineMarkdown(s: String, link: Color, codeBg: Color): AnnotatedString =
     buildAnnotatedString { appendInline(s, link, codeBg) }
 
-fun markdownToHtml(title: String, md: String): String {
+fun markdownToHtml(title: String, md: String, images: Map<Int, String> = emptyMap()): String {
     val blocks = parseBlocks(md)
     val bodyHtml = StringBuilder()
     for (b in blocks) {
         when (b) {
-            is MdBlock.Heading -> bodyHtml.append("<h${b.level}>${escapeHtml(b.text)}</h${b.level}>\n")
-            is MdBlock.Para -> bodyHtml.append("<p>${escapeHtml(b.text)}</p>\n")
-            is MdBlock.Bullet -> bodyHtml.append("<ul><li>${escapeHtml(b.text)}</li></ul>\n")
+            is MdBlock.Heading -> bodyHtml.append("<h${b.level}>${embedImages(escapeHtml(b.text), images)}</h${b.level}>\n")
+            is MdBlock.Para -> bodyHtml.append("<p>${embedImages(escapeHtml(b.text), images)}</p>\n")
+            is MdBlock.Bullet -> bodyHtml.append("<ul><li>${embedImages(escapeHtml(b.text), images)}</li></ul>\n")
             is MdBlock.Code -> bodyHtml.append("<pre><code>${escapeHtml(b.text)}</code></pre>\n")
-            is MdBlock.Quote -> bodyHtml.append("<blockquote>${escapeHtml(b.text)}</blockquote>\n")
+            is MdBlock.Quote -> bodyHtml.append("<blockquote>${embedImages(escapeHtml(b.text), images)}</blockquote>\n")
             MdBlock.Rule -> bodyHtml.append("<hr/>\n")
         }
     }
@@ -184,6 +184,8 @@ fun markdownToHtml(title: String, md: String): String {
           pre { background: #f5f5f5; padding: 12px; border-radius: 6px; overflow-x: auto; font-family: monospace; font-size: 13px; }
           blockquote { border-left: 4px solid #ccc; margin: 0; padding-left: 12px; color: #555; }
           hr { border: none; border-top: 1px solid #ddd; margin: 20px 0; }
+          img.shot { max-width: 100%; border: 1px solid #ddd; border-radius: 6px; margin: 10px 0; }
+          figcaption { color: #777; font-size: 12px; margin-top: 2px; }
         </style>
         </head>
         <body>
@@ -192,6 +194,17 @@ fun markdownToHtml(title: String, md: String): String {
         </body>
         </html>
     """.trimIndent()
+}
+
+/** Replaces [Screenshot N] references with the actual captured slide, so the notes and the PDF show what the teacher drew. */
+private fun embedImages(escaped: String, images: Map<Int, String>): String {
+    if (images.isEmpty()) return escaped
+    return Regex("""\[Screenshot (\d+)\]\"\"\").replace(escaped) { m ->
+        val n = m.groupValues[1].toIntOrNull() ?: return@replace m.value
+        val b64 = images[n] ?: return@replace m.value
+        "<figure><img class=\"shot\" src=\"data:image/jpeg;base64,$b64\" alt=\"Screenshot $n\"/>" +
+            "<figcaption>Screenshot $n</figcaption></figure>"
+    }
 }
 
 private fun escapeHtml(s: String): String = s

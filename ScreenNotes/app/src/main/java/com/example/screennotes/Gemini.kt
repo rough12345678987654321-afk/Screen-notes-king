@@ -35,19 +35,28 @@ object Gemini {
     private const val IMG_WIDTH = 1024 // enough to read slides; about half the tokens of the old 1280px uploads
     private const val IMG_QUALITY = 80
 
-    private val PROMPT = """You are an expert JEE study note-taker. Below are consecutive screenshots from a lecture or video,
-in order. Each screenshot comes with OCR text that may contain mistakes, so trust the IMAGE over the OCR text.
-Read slide text, handwriting, equations, diagrams, graphs and tables directly from the images.
-Ignore interface clutter: clock/battery bars, video-call tiles, participant names, toolbars, floating buttons.
+    private val PROMPT = """You are an expert JEE teacher and note-taker (Physics, Chemistry, Maths).
+Below are consecutive screenshots from a lecture or video, in order. Each comes with OCR text that
+may contain mistakes, so trust the IMAGE over the OCR text. Read slide text, handwriting, equations,
+diagrams, graphs and tables directly from the images. Ignore interface clutter: clock/battery bars,
+video-call tiles, participant names, toolbars, floating buttons, file names, player controls.
 
-Write exceptionally clean, beautifully formatted study notes in Markdown:
-- Use clear headings (# Topic, ## Subtopic) with appropriate emojis (e.g. ⚛️, 🧪, 📐, ⚡, 📌, ⚠️, 💡, ⭐).
-- Use structured bullet points, numbered lists for derivation steps, and neat Unicode tables for comparisons.
-- Bold key definitions and important formulas. Keep every formula, reaction step, and condition.
-- For diagrams and graphs (like adsorption isotherms, curves, or geometry), describe them clearly in words (axes, curves, regions, trends) and render clean text/ASCII schematics when helpful.
-- Mention "[Screenshot N]" where a slide's visual graph or diagram matters.
-- IMPORTANT formatting rule: do NOT use LaTeX or dollar signs. Write all math, chemistry and physics formulas in plain text with Unicode, for example H₂O, P₄, SO₄²⁻, x/m = aP / (1 + bP), θ = KP / (1 + KP), ΔH, α, β, ∫, Σ, √, →, ⇌, ≈, ≥, ≤, °C.
-- End with a concise summary and a list of high-yield JEE exam questions.
+Write study notes in Markdown that a student can revise from quickly:
+- Start with "# <topic title>", then one line: why this topic matters for JEE.
+- Use "## " sections, each starting with one fitting emoji (⚛️  📐  📌  ⭐ ️), and "### " subsections.
+- Teach every concept in three beats: the idea in plain words (the WHY), then the mechanism or
+  derivation, then the formula. Never dump facts without connecting them.
+- Number derivation steps (1. 2. 3.), one cognitive job per line.
+- Bold key definitions and final formulas. Keep EVERY formula, reaction step, constant, unit and
+  condition that appears on the screens.
+- Put comparisons into a Markdown table.
+- Diagrams and graphs: describe them in words (axes, curves, regions, arrows, labels, trends) and
+  add a small ASCII sketch in a ``` block when it truly helps.
+- Where a slide's visual matters, write [Screenshot N] on its own line.
+- FORMULAS: plain text with Unicode only. NEVER LaTeX, never dollar signs, never backslashes.
+  Examples: H₂O, SO₄²⁻, x/m = aP/(1+bP), θ = KP/(1+KP), ΔH, α, β, ∫, Σ, √, →, ⇌, ≈, ≥, ≤, °C, mv²/2.
+- End with three short sections: "## ⭐ Quick recap" (5-8 bullets), "## ⚠️ Exam traps" (the mistakes
+  students make in this topic), "## 📌 Likely JEE questions" (3-6 questions, no answers needed).
 - Do not invent facts that are not on the screens.
 
 SCREENSHOTS:
@@ -70,6 +79,8 @@ SCREENSHOTS:
     }
 
     /** Downscale + recompress one screenshot so the free quota lasts longer. */
+    fun shrinkForUpload(jpeg: ByteArray): ByteArray = shrink(jpeg)
+
     private fun shrink(jpeg: ByteArray): ByteArray = try {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size, bounds)
@@ -130,7 +141,7 @@ SCREENSHOTS:
             while (ki < keys.size) {
                 val (code, reply) = callApi(keys[ki], model, body)
                 when {
-                    code in 200..299 -> return NotesResult(parseReply(reply), model, mi > 0)
+                    code in 200..299 -> return NotesResult(NotesClean.cleanNotes(parseReply(reply)), model, mi > 0)
                     // Quota or bad key for THIS project: the next key is a different project.
                     code == 429 || code == 401 || code == 403 -> ki++
                     // Model name retired by Google: skip to the next model.
