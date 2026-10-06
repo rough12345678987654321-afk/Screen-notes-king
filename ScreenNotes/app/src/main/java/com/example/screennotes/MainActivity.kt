@@ -53,6 +53,14 @@ import java.io.File
 import java.text.DateFormat
 import java.util.Date
 
+/** The owner's Gemini keys: one field, several free projects separated by commas or new lines. */
+fun geminiKeys(prefs: android.content.SharedPreferences): List<String> =
+    (prefs.getString("key", "") ?: "").split(Regex("[,;\n]")).map { it.trim() }.filter { it.isNotBlank() }
+
+/** The model the owner picked for notes (default when nothing picked yet). */
+fun geminiModel(prefs: android.content.SharedPreferences): String =
+    prefs.getString("model", "")?.takeIf { it.isNotBlank() } ?: Gemini.DEFAULT_MODEL
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -159,8 +167,27 @@ fun Home(onOpen: (Long) -> Unit) {
         OutlinedTextField(
             value = key,
             onValueChange = { key = it; prefs.edit().putString("key", it).apply() },
-            label = { Text("Gemini API key (free, from aistudio.google.com/apikey)") },
+            label = { Text("Gemini API key(s), free from aistudio.google.com/apikey - several keys? separate with commas") },
             modifier = Modifier.fillMaxWidth(), singleLine = true
+        )
+        var model by remember { mutableStateOf(geminiModel(prefs)) }
+        var modelMenu by remember { mutableStateOf(false) }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text("Notes AI model:", style = MaterialTheme.typography.bodyMedium)
+            OutlinedButton(onClick = { modelMenu = true }) { Text(model) }
+            DropdownMenu(expanded = modelMenu, onDismissRequest = { modelMenu = false }) {
+                Gemini.MODELS.forEach { m ->
+                    DropdownMenuItem(
+                        text = { Text(m) },
+                        onClick = { model = m; prefs.edit().putString("model", m).apply(); modelMenu = false }
+                    )
+                }
+            }
+        }
+        Text(
+            "Free quota is per model and per Google project. When a limit is hit the app " +
+                "automatically finishes the notes with the lighter flash-lite model and tells you.",
+            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant
         )
 
         var urlInput by remember { mutableStateOf("") }
@@ -241,7 +268,8 @@ fun Home(onOpen: (Long) -> Unit) {
                             
                             // If it's YouTube or web article / drive, extract key info or generate summary note via Gemini directly or via simulated snapshots
                             val prompt = "Create comprehensive structured study notes with explanations, formulas and key points from this link or topic: $link"
-                            val notes = Gemini.makeNotes(key.ifBlank { prefs.getString("key", "") ?: "" }, listOf(Slide(prompt, null)))
+                            val res = Gemini.makeNotes(geminiKeys(prefs), listOf(Slide(prompt, null)), geminiModel(prefs))
+                            val notes = res.text
                             
                             dao.updateNote(dao.noteOnce(nId)?.copy(aiNotes = notes) ?: Note(id = nId, title = title, createdAt = System.currentTimeMillis(), aiNotes = notes))
                             
@@ -303,24 +331,53 @@ fun Detail(id: Long, onBack: () -> Unit) {
     var text by remember(note?.id) { mutableStateOf(note?.aiNotes ?: "") }
     var busy by remember { mutableStateOf(false) }
     var previewMode by remember { mutableStateOf("markdown") } // "markdown", "html", "images"
+    var notice by remember { mutableStateOf("") }
+    var confirmRegen by remember { mutableStateOf(false) }
+
+    // (Re)generate the notes with the owner's keys and model; reports a fallback honestly.
+    val regenerate: () -> Unit = {
+        busy = true
+        scope.launch {
+            val res = withContext(Dispatchers.IO) {
+                try {
+                    val slides = shots.map { s ->
+                        Slide(s.ocrText, runCatching { File(s.path).readBytes() }.getOrNull())
+                    }
+                    Gemini.makeNotes(geminiKeys(prefs), slides, geminiModel(prefs))
+                } catch (e: Exception) {
+                    NotesResult("Error: ${e.message}", geminiModel(prefs), false)
+                }
+            }
+            text = res.text
+            notice = if (res.fellBack) {
+                "Your main model's free quota was used up, so ${res.model} (lighter) wrote these notes."
+            } else ""
+            busy = false
+        }
+    }
 
     // Auto-generate AI notes when opening the page if aiNotes is empty and shots are available
     LaunchedEffect(note?.id, shots.size) {
         if (note != null && note!!.aiNotes.isBlank() && shots.isNotEmpty() && !busy) {
-            val key = prefs.getString("key", "") ?: ""
-            if (key.isNotBlank()) {
+            val keys = geminiKeys(prefs)
+            if (keys.isNotEmpty()) {
                 busy = true
-                val generated = withContext(Dispatchers.IO) {
+                val res = withContext(Dispatchers.IO) {
                     try {
                         val slideList = shots.map { s ->
                             Slide(s.ocrText, runCatching { File(s.path).readBytes() }.getOrNull())
                         }
-                        Gemini.makeNotes(key, slideList)
-                    } catch (e: Exception) { "Error: ${e.message}" }
+                        Gemini.makeNotes(keys, slideList, geminiModel(prefs))
+                    } catch (e: Exception) {
+                        NotesResult("Error: ${e.message}", geminiModel(prefs), false)
+                    }
                 }
-                text = generated
+                text = res.text
+                notice = if (res.fellBack) {
+                    "Your main model's free quota was used up, so ${res.model} (lighter) wrote these notes."
+                } else ""
                 busy = false
-                dao.updateNote(note!!.copy(aiNotes = generated))
+                dao.updateNote(note!!.copy(aiNotes = res.text))
             }
         }
     }
@@ -331,22 +388,30 @@ fun Detail(id: Long, onBack: () -> Unit) {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                     OutlinedButton(onClick = onBack) { Text("Back") }
                     Button(enabled = !busy && shots.isNotEmpty(), onClick = {
-                        val key = prefs.getString("key", "") ?: ""
-                        if (key.isBlank()) { text = "Paste your Gemini API key on the home screen first."; return@Button }
-                        busy = true
-                        scope.launch {
-                            text = withContext(Dispatchers.IO) {
-                                try {
-                                    val slides = shots.map { s ->
-                                        Slide(s.ocrText, runCatching { File(s.path).readBytes() }.getOrNull())
-                                    }
-                                    Gemini.makeNotes(key, slides)
-                                } catch (e: Exception) { "Error: ${e.message}" }
-                            }
-                            busy = false
+                        if (geminiKeys(prefs).isEmpty()) {
+                            text = "Paste your Gemini API key on the home screen first."
+                            return@Button
                         }
+                        if (text.isNotBlank()) confirmRegen = true else regenerate()
                     }) { Text(if (busy) "Writing..." else "Make AI notes") }
                     Spacer(Modifier.weight(1f))
+                }
+                if (notice.isNotBlank()) {
+                    Text(notice, style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                if (confirmRegen) {
+                    AlertDialog(
+                        onDismissRequest = { confirmRegen = false },
+                        title = { Text("Rewrite these notes?") },
+                        text = { Text("The AI replaces the current notes (including your edits) with a fresh version.") },
+                        confirmButton = {
+                            TextButton(onClick = { confirmRegen = false; regenerate() }) { Text("Rewrite") }
+                        },
+                        dismissButton = {
+                            TextButton(onClick = { confirmRegen = false }) { Text("Keep mine") }
+                        }
+                    )
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
                     FilterChip(selected = previewMode == "markdown", onClick = { previewMode = "markdown" }, label = { Text("Preview") })
