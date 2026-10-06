@@ -47,7 +47,7 @@ object PdfExport {
             pager.finishPage()
             val tmp = File(ctx.cacheDir, fileName)
             val out = tmp.outputStream()
-            doc.write(out)
+            doc.writeTo(out)
             out.close()
             doc.close()
             onDone(publish(ctx, tmp, fileName), null)
