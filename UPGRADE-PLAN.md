@@ -113,3 +113,20 @@ no experimental Compose APIs, `.github/` touched only for CI caching in U3).
 - Free-tier daily requests per model (Sep 2026): scriptbyai.com/gemini-api-free-tier-limits
 - Free tier now Flash/Flash-Lite only, quotas adjusted without notice: questloops.com (Aug 2026)
 - Paid pricing reference (what billing would cost): findskill.ai (May 2026)
+
+---
+
+## 5. Status (6 Oct 2026)
+
+- **U1 done** — PR #18 merged into main: updates #2, #4, #6, #10, #12, #13 are now in one
+  release; the 7 stale pull requests were closed as superseded; update #16's bad model
+  rename was dropped.
+- **U2–U8 done** — PR #19 (branch arena/94c1f3aa): model ladder + picker + honest fallback,
+  key-pool rotation, downscaled uploads, Gradle cache, regenerate guard (U2+U3); canonical
+  JEE prompt + LaTeX→Unicode sanitizer NotesClean.kt (U4); slide images inline in HTML/PDF +
+  numbered zoomable slides (U5); capture warm-up, status-bar/letterbox crop, empty-frame skip
+  (U6); direct PDF export to Downloads/ScreenNotes via PdfExport.kt, no print dialog (U7);
+  Drive-PDF import by link + video links hand off to capture (U8). CI build green.
+- Still open for later: issue #16 (Drive edge cases), closing the finished issues (the Arena
+  token cannot close issues; tap them closed on GitHub or in the app), and making the
+  repository private (setup card in the Updates tab).
