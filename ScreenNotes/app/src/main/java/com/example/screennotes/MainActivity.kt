@@ -4,9 +4,27 @@ import android.Manifest
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.pdf.PdfRenderer
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Bundle
+import android.graphics.Color
+import android.graphics.pdf.PdfDocument
+import android.os.CancellationSignal
+import android.os.ParcelFileDescriptor
+import android.print.PageRange
+import android.print.PrintAttributes
+import android.print.PrintDocumentAdapter
+import android.print.PrintDocumentInfo
+import android.print.PrintManager
+import android.text.Layout
+import android.text.StaticLayout
+import android.text.TextPaint
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.widget.Toast
+import java.io.FileOutputStream
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -25,12 +43,15 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.viewinterop.AndroidView
 import coil.compose.AsyncImage
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.text.DateFormat
+import java.util.Date
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -141,12 +162,121 @@ fun Home(onOpen: (Long) -> Unit) {
             label = { Text("Gemini API key (free, from aistudio.google.com/apikey)") },
             modifier = Modifier.fillMaxWidth(), singleLine = true
         )
+
+        var urlInput by remember { mutableStateOf("") }
+        var importing by remember { mutableStateOf(false) }
+        var importStatus by remember { mutableStateOf("") }
+
+        val pdfLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            if (uri != null) {
+                importing = true
+                importStatus = "Importing PDF pages..."
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        val pfd = ctx.contentResolver.openFileDescriptor(uri, "r")
+                        if (pfd != null) {
+                            val renderer = PdfRenderer(pfd)
+                            val title = "PDF " + java.text.SimpleDateFormat("d MMM, HH:mm", java.util.Locale.getDefault()).format(java.util.Date())
+                            val nId = dao.insertNote(Note(title = title, createdAt = System.currentTimeMillis()))
+                            val shotsDir = File(ctx.filesDir, "shots/$nId").apply { mkdirs() }
+                            
+                            val pageCount = minOf(renderer.pageCount, 50)
+                            for (i in 0 until pageCount) {
+                                val page = renderer.openPage(i)
+                                val bmp = Bitmap.createBitmap(1280, (1280f * page.height / page.width).toInt(), Bitmap.Config.ARGB_8888)
+                                page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                                page.close()
+                                
+                                val file = File(shotsDir, "${i * 1000L}.jpg")
+                                file.outputStream().use { bmp.compress(Bitmap.CompressFormat.JPEG, 90, it) }
+                                dao.insertShot(Shot(noteId = nId, path = file.absolutePath, ocrText = "PDF page ${i+1}", timeMs = i * 1000L))
+                            }
+                            renderer.close()
+                            pfd.close()
+                            withContext(Dispatchers.Main) {
+                                importing = false
+                                onOpen(nId)
+                            }
+                        }
+                    } catch (e: Exception) {
+                        withContext(Dispatchers.Main) {
+                            importing = false
+                            importStatus = "Error: ${e.message}"
+                        }
+                    }
+                }
+            }
+        }
+
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+            OutlinedButton(
+                enabled = !importing,
+                onClick = { pdfLauncher.launch(arrayOf("application/pdf")) },
+                modifier = Modifier.weight(1f)
+            ) {
+                Text(if (importing && importStatus.contains("PDF")) importStatus else "Import PDF / Slides")
+            }
+        }
+
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+            OutlinedTextField(
+                value = urlInput,
+                onValueChange = { urlInput = it },
+                label = { Text("YouTube / Drive / Web link") },
+                modifier = Modifier.weight(1f),
+                singleLine = true
+            )
+            Button(
+                enabled = !importing && urlInput.isNotBlank(),
+                onClick = {
+                    val link = urlInput.trim()
+                    urlInput = ""
+                    importing = true
+                    importStatus = "Processing link..."
+                    scope.launch(Dispatchers.IO) {
+                        try {
+                            val title = "Link Note " + java.text.SimpleDateFormat("d MMM, HH:mm", java.util.Locale.getDefault()).format(java.util.Date())
+                            val nId = dao.insertNote(Note(title = title, createdAt = System.currentTimeMillis()))
+                            val shotsDir = File(ctx.filesDir, "shots/$nId").apply { mkdirs() }
+                            
+                            // If it's YouTube or web article / drive, extract key info or generate summary note via Gemini directly or via simulated snapshots
+                            val prompt = "Create comprehensive structured study notes with explanations, formulas and key points from this link or topic: $link"
+                            val notes = Gemini.makeNotes(key.ifBlank { prefs.getString("key", "") ?: "" }, listOf(Slide(prompt, null)))
+                            
+                            dao.updateNote(dao.noteOnce(nId)?.copy(aiNotes = notes) ?: Note(id = nId, title = title, createdAt = System.currentTimeMillis(), aiNotes = notes))
+                            
+                            withContext(Dispatchers.Main) {
+                                importing = false
+                                onOpen(nId)
+                            }
+                        } catch (e: Exception) {
+                            withContext(Dispatchers.Main) {
+                                importing = false
+                                importStatus = "Error: ${e.message}"
+                            }
+                        }
+                    }
+                }
+            ) {
+                Text("Process Link")
+            }
+        }
+        if (importing && !importStatus.contains("PDF")) {
+            Text(importStatus, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+        }
         Text("History", style = MaterialTheme.typography.titleMedium)
         LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             items(notes) { n ->
                 Card(onClick = { onOpen(n.id) }, modifier = Modifier.fillMaxWidth()) {
                     Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Text(n.title, Modifier.weight(1f))
+                        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            Text(n.title)
+                            Text(
+                                java.text.SimpleDateFormat("d MMM yyyy, HH:mm", java.util.Locale.getDefault()).format(java.util.Date(n.createdAt)),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
                         TextButton(onClick = { scope.launch { deleteNote(ctx, n.id) } }) { Text("Delete") }
                     }
                 }
@@ -172,7 +302,7 @@ fun Detail(id: Long, onBack: () -> Unit) {
     val prefs = remember { ctx.getSharedPreferences("p", Context.MODE_PRIVATE) }
     var text by remember(note?.id) { mutableStateOf(note?.aiNotes ?: "") }
     var busy by remember { mutableStateOf(false) }
-    var previewMode by remember { mutableStateOf(true) }
+    var previewMode by remember { mutableStateOf("markdown") } // "markdown", "html", "images"
 
     // Auto-generate AI notes when opening the page if aiNotes is empty and shots are available
     LaunchedEffect(note?.id, shots.size) {
@@ -197,49 +327,148 @@ fun Detail(id: Long, onBack: () -> Unit) {
 
     LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item {
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                OutlinedButton(onClick = onBack) { Text("Back") }
-                Button(enabled = !busy && shots.isNotEmpty(), onClick = {
-                    val key = prefs.getString("key", "") ?: ""
-                    if (key.isBlank()) { text = "Paste your Gemini API key on the home screen first."; return@Button }
-                    busy = true
-                    scope.launch {
-                        text = withContext(Dispatchers.IO) {
-                            try {
-                                val slides = shots.map { s ->
-                                    Slide(s.ocrText, runCatching { File(s.path).readBytes() }.getOrNull())
-                                }
-                                Gemini.makeNotes(key, slides)
-                            } catch (e: Exception) { "Error: ${e.message}" }
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    OutlinedButton(onClick = onBack) { Text("Back") }
+                    Button(enabled = !busy && shots.isNotEmpty(), onClick = {
+                        val key = prefs.getString("key", "") ?: ""
+                        if (key.isBlank()) { text = "Paste your Gemini API key on the home screen first."; return@Button }
+                        busy = true
+                        scope.launch {
+                            text = withContext(Dispatchers.IO) {
+                                try {
+                                    val slides = shots.map { s ->
+                                        Slide(s.ocrText, runCatching { File(s.path).readBytes() }.getOrNull())
+                                    }
+                                    Gemini.makeNotes(key, slides)
+                                } catch (e: Exception) { "Error: ${e.message}" }
+                            }
+                            busy = false
                         }
-                        busy = false
-                    }
-                }) { Text(if (busy) "Writing..." else "Make AI notes") }
-                Spacer(Modifier.weight(1f))
-                OutlinedButton(onClick = { previewMode = !previewMode }) {
-                    Text(if (previewMode) "Edit notes" else "Preview notes")
+                    }) { Text(if (busy) "Writing..." else "Make AI notes") }
+                    Spacer(Modifier.weight(1f))
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
+                    FilterChip(selected = previewMode == "markdown", onClick = { previewMode = "markdown" }, label = { Text("Preview") })
+                    FilterChip(selected = previewMode == "html", onClick = { previewMode = "html" }, label = { Text("HTML view") })
+                    FilterChip(selected = previewMode == "images", onClick = { previewMode = "images" }, label = { Text("Images & Sources") })
+                    FilterChip(selected = previewMode == "edit", onClick = { previewMode = "edit" }, label = { Text("Edit") })
                 }
             }
         }
         item {
-            if (previewMode) {
-                Card(Modifier.fillMaxWidth()) {
-                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                        Text("Notes Preview", style = MaterialTheme.typography.titleMedium)
-                        HorizontalDivider()
-                        if (text.isBlank()) {
-                            Text("No notes yet. Tap \"Make AI notes\" above.", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        } else {
-                            MarkdownText(text)
+            when (previewMode) {
+                "markdown" -> {
+                    Card(Modifier.fillMaxWidth()) {
+                        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                            Text("Notes Preview", style = MaterialTheme.typography.titleMedium)
+                            HorizontalDivider()
+                            if (text.isBlank()) {
+                                Text("No notes yet. Tap \"Make AI notes\" above.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            } else {
+                                MarkdownText(text)
+                            }
                         }
                     }
                 }
-            } else {
-                OutlinedTextField(
-                    value = text, onValueChange = { text = it },
-                    label = { Text("Your notes (editable)") },
-                    modifier = Modifier.fillMaxWidth().heightIn(min = 300.dp)
-                )
+                "html" -> {
+                    Card(Modifier.fillMaxWidth()) {
+                        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                            Text("HTML Preview & PDF Export", style = MaterialTheme.typography.titleMedium)
+                            HorizontalDivider()
+                            val htmlContent = remember(text) { markdownToHtml(note?.title ?: "Study Notes", text) }
+                            Box(Modifier.fillMaxWidth().height(350.dp)) {
+                                AndroidView(
+                                    factory = { c ->
+                                        WebView(c).apply {
+                                            webViewClient = WebViewClient()
+                                            settings.javaScriptEnabled = true
+                                        }
+                                    },
+                                    update = { webView ->
+                                        webView.loadDataWithBaseURL(null, htmlContent, "text/html", "UTF-8", null)
+                                    },
+                                    modifier = Modifier.fillMaxSize()
+                                )
+                            }
+                            Button(onClick = {
+                                val html = markdownToHtml(note?.title ?: "Study Notes", text)
+                                val printManager = ctx.getSystemService(Context.PRINT_SERVICE) as PrintManager
+                                val printAdapter = object : PrintDocumentAdapter() {
+                                    private var webView: WebView? = null
+                                    override fun onLayout(
+                                        oldAttributes: PrintAttributes?,
+                                        newAttributes: PrintAttributes?,
+                                        cancellationSignal: android.os.CancellationSignal?,
+                                        callback: LayoutResultCallback?,
+                                        extras: Bundle?
+                                    ) {
+                                        webView = WebView(ctx).apply {
+                                            webViewClient = object : WebViewClient() {
+                                                override fun onPageFinished(view: WebView?, url: String?) {
+                                                    val builder = android.print.PrintDocumentInfo.Builder("${note?.title ?: "Notes"}.pdf")
+                                                        .setContentType(android.print.PrintDocumentInfo.CONTENT_TYPE_DOCUMENT)
+                                                        .setPageCount(android.print.PrintDocumentInfo.PAGE_COUNT_UNKNOWN)
+                                                    callback?.onLayoutFinished(builder.build(), true)
+                                                }
+                                            }
+                                            loadDataWithBaseURL(null, html, "text/html", "UTF-8", null)
+                                        }
+                                    }
+                                    override fun onWrite(
+                                        pages: Array<out android.print.PageRange>?,
+                                        destination: android.os.ParcelFileDescriptor?,
+                                        cancellationSignal: android.os.CancellationSignal?,
+                                        callback: WriteResultCallback?
+                                    ) {
+                                        webView?.let {
+                                            val adapter = it.createPrintDocumentAdapter("StudyNotes")
+                                            adapter.onWrite(pages, destination, cancellationSignal, callback)
+                                        }
+                                    }
+                                }
+                                printManager.print("${note?.title ?: "Study Notes"} PDF", printAdapter, PrintAttributes.Builder().build())
+                            }, modifier = Modifier.fillMaxWidth()) {
+                                Text("Save as PDF file")
+                            }
+                        }
+                    }
+                }
+                "images" -> {
+                    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Text("Captured screens & Google sources (${shots.size})", style = MaterialTheme.typography.titleMedium)
+                        if (shots.isEmpty()) {
+                            Text("No captured screens.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        } else {
+                            shots.forEach { s ->
+                                Card(Modifier.fillMaxWidth()) {
+                                    Column(Modifier.padding(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                        AsyncImage(model = File(s.path), contentDescription = null, modifier = Modifier.fillMaxWidth())
+                                        if (s.ocrText.isNotBlank()) Text(s.ocrText, style = MaterialTheme.typography.bodySmall)
+                                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                                            val query = s.ocrText.take(60).trim().ifBlank { note?.title ?: "JEE study" }
+                                            OutlinedButton(onClick = {
+                                                val intent = Intent(Intent.ACTION_VIEW, android.net.Uri.parse("https://www.google.com/search?q=${android.net.Uri.encode(query)}"))
+                                                ctx.startActivity(intent)
+                                            }) { Text("Search on Google") }
+                                            Spacer(Modifier.weight(1f))
+                                            TextButton(onClick = {
+                                                scope.launch(Dispatchers.IO) { File(s.path).delete(); dao.deleteShot(s) }
+                                            }) { Text("Delete this screenshot") }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                else -> {
+                    OutlinedTextField(
+                        value = text, onValueChange = { text = it },
+                        label = { Text("Your notes (editable)") },
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 300.dp)
+                    )
+                }
             }
         }
         item {
@@ -249,19 +478,84 @@ fun Detail(id: Long, onBack: () -> Unit) {
                     val send = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, text)
                     ctx.startActivity(Intent.createChooser(send, "Share notes"))
                 }) { Text("Share / Export") }
-            }
-        }
-        item { Text("Captured screens (${shots.size})", style = MaterialTheme.typography.titleMedium) }
-        items(shots) { s ->
-            Card(Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    AsyncImage(model = File(s.path), contentDescription = null, modifier = Modifier.fillMaxWidth())
-                    if (s.ocrText.isNotBlank()) Text(s.ocrText, style = MaterialTheme.typography.bodySmall)
-                    TextButton(onClick = {
-                        scope.launch(Dispatchers.IO) { File(s.path).delete(); dao.deleteShot(s) }
-                    }) { Text("Delete this screenshot") }
-                }
+                OutlinedButton(onClick = {
+                    try {
+                        val printManager = ctx.getSystemService(Context.PRINT_SERVICE) as PrintManager
+                        val jobName = (note?.title ?: "Screen Notes") + " Notes"
+                        val printAdapter = object : PrintDocumentAdapter() {
+                            override fun onWrite(
+                                pages: Array<out PageRange>,
+                                destination: ParcelFileDescriptor,
+                                cancellationSignal: CancellationSignal,
+                                callback: WriteResultCallback
+                            ) {
+                                val pdfDoc = PdfDocument()
+                                val pageInfo = PdfDocument.PageInfo.Builder(595, 842, 1).create()
+                                val page = pdfDoc.startPage(pageInfo)
+                                
+                                val canvas = page.canvas
+                                val paint = TextPaint().apply {
+                                    textSize = 12f
+                                    color = Color.BLACK
+                                }
+                                val titlePaint = TextPaint().apply {
+                                    textSize = 20f
+                                    isFakeBoldText = true
+                                    color = Color.BLACK
+                                }
+
+                                canvas.drawText(note?.title ?: "Screen Notes", 40f, 60f, titlePaint)
+
+                                val contentStr = text.ifBlank { "No notes" }
+                                val layout = if (Build.VERSION.SDK_INT >= 23) {
+                                    StaticLayout.Builder.obtain(
+                                        contentStr, 0, contentStr.length, paint, 515
+                                    ).setAlignment(Layout.Alignment.ALIGN_NORMAL)
+                                     .setLineSpacing(1f, 1.2f)
+                                     .build()
+                                } else {
+                                    @Suppress("DEPRECATION")
+                                    StaticLayout(
+                                        contentStr, paint, 515,
+                                        Layout.Alignment.ALIGN_NORMAL, 1.2f, 0f, false
+                                    )
+                                }
+
+                                canvas.save()
+                                canvas.translate(40f, 90f)
+                                layout.draw(canvas)
+                                canvas.restore()
+
+                                pdfDoc.finishPage(page)
+                                try {
+                                    pdfDoc.writeTo(FileOutputStream(destination.fileDescriptor))
+                                    pdfDoc.close()
+                                    callback.onWriteFinished(arrayOf(PageRange.ALL_PAGES))
+                                } catch (e: Exception) {
+                                    callback.onWriteFailed(e.message)
+                                }
+                            }
+
+                            override fun onLayout(
+                                oldAttributes: PrintAttributes?,
+                                newAttributes: PrintAttributes?,
+                                cancellationSignal: CancellationSignal?,
+                                callback: LayoutResultCallback?,
+                                extras: android.os.Bundle?
+                            ) {
+                                val builder = PrintDocumentInfo.Builder((note?.title ?: "Notes") + ".pdf")
+                                    .setContentType(PrintDocumentInfo.CONTENT_TYPE_DOCUMENT)
+                                    .setPageCount(1)
+                                callback?.onLayoutFinished(builder.build(), true)
+                            }
+                        }
+                        printManager.print(jobName, printAdapter, PrintAttributes.Builder().build())
+                    } catch (e: Exception) {
+                        Toast.makeText(ctx, "Print / PDF error: ${e.message}", Toast.LENGTH_SHORT).show()
+                    }
+                }) { Text("Save as PDF") }
             }
         }
     }
 }
+
