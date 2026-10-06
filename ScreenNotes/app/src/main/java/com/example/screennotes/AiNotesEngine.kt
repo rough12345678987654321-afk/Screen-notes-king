@@ -80,6 +80,7 @@ object AiNotesEngine {
     private const val IMAGE_WIDTH = 1024
     private const val IMAGE_QUALITY = 80
     private const val MAX_OCR_CHARS = 48_000
+    private const val MAX_JUDGE_OCR_CHARS = 120_000
     private const val MAX_DRAFT_CHARS = 24_000
 
     private val geminiEndpoint = "https://generativelanguage.googleapis.com/v1beta/models/"
@@ -380,9 +381,23 @@ object AiNotesEngine {
     ): NotesResult {
         // Without captures there is no evidence to judge against, so the notes stay as they are.
         if (notes.text.isBlank() || slides.isEmpty()) return notes
+        val judgeOcr = judgeOcrEvidence(slides)
         val evidence = buildString {
             append("STITCHED OCR EVIDENCE FROM THE CAPTURES (in order):\n")
-            append(stitchedOcrEvidence(slides))
+            append("CAPTURE SEQUENCE (original screenshot numbers, in order): ")
+            append(formatCaptureSequence(judgeOcr.screenshotNumbers))
+            append(" (${judgeOcr.screenshotNumbers.size} captures).\n")
+            append("OCR shown below covers the first ${judgeOcr.includedCaptureCount} captures in that sequence.\n")
+            append(judgeOcr.text.ifBlank { "No captured slide text was available." })
+            when {
+                judgeOcr.partialScreenshotNumber != null -> append(
+                    "\n[EVIDENCE TRUNCATED: OCR for Screenshot ${judgeOcr.partialScreenshotNumber} is partial; " +
+                        "the last ${judgeOcr.droppedCaptureCount} captures are not shown.]\n"
+                )
+                judgeOcr.droppedCaptureCount > 0 -> append(
+                    "\n[EVIDENCE TRUNCATED: the last ${judgeOcr.droppedCaptureCount} captures are not shown.]\n"
+                )
+            }
             append("\n\nFINAL NOTES TO JUDGE (complete text):\n")
             append(notes.text)
         }
@@ -404,6 +419,97 @@ object AiNotesEngine {
             sources = (notes.sources + output.source.label).distinct(),
             notice = notes.notice
         )
+    }
+
+    private data class JudgeOcrEvidence(
+        val text: String,
+        val screenshotNumbers: List<Int>,
+        val includedCaptureCount: Int,
+        val droppedCaptureCount: Int,
+        val partialScreenshotNumber: Int?
+    )
+
+    /** Build judge evidence once, keeping whole captures where possible and respecting its larger budget. */
+    private fun judgeOcrEvidence(slides: List<Slide>): JudgeOcrEvidence {
+        val screenshotNumbers = slides.mapIndexed { index, slide ->
+            slide.screenshotNumber.takeIf { it > 0 } ?: index + 1
+        }
+        val boundaryLength = "\n[capture boundary]\n".length
+        var includedCaptureCount = 0
+        var includedTextCount = 0
+        var estimatedLength = 0
+        var partialIndex: Int? = null
+        var partialText: String? = null
+
+        for ((index, slide) in slides.withIndex()) {
+            val ocr = slide.ocr.trim()
+            if (ocr.isEmpty()) {
+                includedCaptureCount = index + 1
+                continue
+            }
+
+            val separatorLength = if (includedTextCount > 0) boundaryLength else 0
+            val remaining = MAX_JUDGE_OCR_CHARS - estimatedLength - separatorLength
+            if (ocr.length <= remaining) {
+                estimatedLength += separatorLength + ocr.length
+                includedTextCount++
+                includedCaptureCount = index + 1
+                continue
+            }
+
+            // If the first non-empty capture alone exceeds the budget, retain its prefix and label it partial.
+            if (includedTextCount == 0 && remaining > 0) {
+                partialIndex = index
+                partialText = ocr.take(remaining)
+                includedCaptureCount = index + 1
+            }
+            // Keep a prefix of complete captures. The truncation notice tells the judge not to infer gaps in the tail.
+            break
+        }
+
+        val includedSlides = slides.take(includedCaptureCount).mapIndexed { index, slide ->
+            if (index == partialIndex) {
+                Slide(partialText.orEmpty(), slide.jpeg, slide.screenshotNumber, slide.jpegFile)
+            } else {
+                slide
+            }
+        }
+        val stitched = OcrStitcher.stitchOcr(includedSlides.map { it.ocr })
+        val exceededBudget = stitched.length > MAX_JUDGE_OCR_CHARS
+        val text = stitched.take(MAX_JUDGE_OCR_CHARS)
+        val fallbackPartialIndex = if (exceededBudget) {
+            includedSlides.indexOfLast { it.ocr.isNotBlank() }.takeIf { it >= 0 }
+        } else {
+            null
+        }
+        val partialScreenshotNumber = (partialIndex ?: fallbackPartialIndex)?.let { index ->
+            includedSlides[index].screenshotNumber.takeIf { it > 0 } ?: index + 1
+        }
+
+        return JudgeOcrEvidence(
+            text = text,
+            screenshotNumbers = screenshotNumbers,
+            includedCaptureCount = includedCaptureCount,
+            droppedCaptureCount = (slides.size - includedCaptureCount).coerceAtLeast(0),
+            partialScreenshotNumber = partialScreenshotNumber
+        )
+    }
+
+    /** Compactly show contiguous original screenshot numbers while making any missing number apparent. */
+    private fun formatCaptureSequence(numbers: List<Int>): String {
+        if (numbers.isEmpty()) return "none"
+        val ranges = mutableListOf<Pair<Int, Int>>()
+        for (number in numbers) {
+            val last = ranges.lastOrNull()
+            if (last != null && number == last.second + 1) {
+                ranges[ranges.lastIndex] = last.first to number
+            } else {
+                ranges += number to number
+            }
+        }
+        return ranges.joinToString(", ") { (first, last) ->
+            if (first == last) "Screenshot $first" else "Screenshots $first–$last"
+        }
     }
 
     private fun fast(
@@ -635,6 +741,9 @@ Your only job is to make those notes complete and honest. Follow these rules exa
 3. If content is genuinely absent from ALL captures, insert exactly this marker on its own line: [gap: not visible in captures]
 4. NEVER invent anything. Do not supply a formula, constant, value, numbered step, reaction or example from memory or convention. If the captures do not show it and no neighboring capture completes it, mark a gap instead of guessing.
 5. Change nothing else: keep the notes' order, wording, headings, Markdown, [Screenshot N] references and plain Unicode formulas exactly as they are.
+6. Paraphrased or summarized content supported by the OCR is present, not a gap. Mark only genuinely absent content, such as a formula, value, step, condition, unit, table row or diagram label.
+7. If the evidence contains an [EVIDENCE TRUNCATED: ...] notice, never mark a gap for content after the last capture shown; it may be present in the omitted captures.
+8. The evidence states the capture sequence and count (for example, Screenshot 1–N). Use it to identify which captures are represented and preserve their order.
 Return only the finished notes in Markdown."""
 }
 
