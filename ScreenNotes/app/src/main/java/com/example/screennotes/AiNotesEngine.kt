@@ -201,7 +201,7 @@ object AiNotesEngine {
 
         val drafted = compose(candidates, keys, slides, mode, ::withInstructions)
         if (!drafted.succeeded) return drafted
-        return think(candidates, keys, slides, drafted, ::withInstructions)
+        return think(candidates, keys, slides, drafted)
     }
 
     /** Fast mode: one call. Top tier: two independent drafts plus an evidence-checked merge. */
@@ -289,21 +289,21 @@ object AiNotesEngine {
         candidates: List<AiSource>,
         keys: Map<AiFamily, String>,
         slides: List<Slide>,
-        notes: NotesResult,
-        withInstructions: (String) -> String
+        notes: NotesResult
     ): NotesResult {
         // Without captures there is no evidence to judge against, so the notes stay as they are.
         if (notes.text.isBlank() || slides.isEmpty()) return notes
         val evidence = buildString {
             append("STITCHED OCR EVIDENCE FROM THE CAPTURES (in order):\n")
             append(stitchedOcrEvidence(slides))
-            append("\n\nNOTES TO JUDGE:\n")
-            append(notes.text.take(MAX_DRAFT_CHARS))
+            append("\n\nFINAL NOTES TO JUDGE (complete text):\n")
+            append(notes.text)
         }
-        // The judge works from the stitched text only (no images are uploaded again): its job is
-        // sequence continuity and honest gaps, not reading the slides a second time.
+        // Send the stitched evidence and finished notes as text to every provider. Vision-capable
+        // Gemini candidates also get the captures so split diagrams can be checked from both sides.
+        // Keep student style instructions out of this final guard so they cannot relax its no-invention rule.
         val result = runLadder(
-            candidates, keys, emptyList(), withInstructions(GAP_PROMPT), mergeEvidenceOverride = evidence
+            candidates, keys, slides, GAP_PROMPT, mergeEvidenceOverride = evidence
         )
         val output = result.output ?: return notes.copy(
             notice = (notes.notice + " Completeness check unavailable: ${result.lastError}").trim()
@@ -537,13 +537,13 @@ Write complete, clear, revision-ready Markdown notes from the supplied lecture e
 Return only the finished notes in Markdown."""
 
     /** The final "thinking" pass: completeness judge. It may only rebuild what the captures contain. */
-    private val GAP_PROMPT = """You are the completeness judge for JEE study notes that were written from screen captures of a lecture.
-You are given the stitched OCR evidence of every capture, in order and with [capture boundary] markers, followed by the notes written from it.
+    private val GAP_PROMPT = """You are the completeness judge for JEE study notes written from screen captures of a lecture.
+You receive the stitched OCR evidence from every capture in order, followed by the complete final notes. If screenshots are attached, inspect them in order too.
 Your only job is to make those notes complete and honest. Follow these rules exactly:
-1. Verify sequence continuity: numbered steps that skip a number, sentences that stop mid-line, derivations that lose a line, tables and diagrams split across two captures.
-2. Where the evidence holds the missing half — usually the capture just before or just after — reconstruct the cut content ONCE and COMPLETE, and do not repeat the overlapping part.
-3. Where content is genuinely absent from ALL captures, insert exactly this marker, on its own line: [gap: not visible in captures]
-4. NEVER invent anything. No formula, constant, value, step, reaction or example that the evidence does not contain. When you are not sure, mark a gap instead of guessing.
+1. Verify sequence continuity: numbered steps that skip a number, sentences cut off mid-line, derivations missing a line, and tables or diagrams split across neighboring captures.
+2. For split text, formulas or diagrams, compare the two neighboring captures. Reconstruct the missing part ONCE and COMPLETE only when their visible evidence supports it; do not repeat overlap.
+3. If content is genuinely absent from ALL captures, insert exactly this marker on its own line: [gap: not visible in captures]
+4. NEVER invent anything. Do not supply a formula, constant, value, numbered step, reaction or example from memory or convention. If the captures do not show it and no neighboring capture completes it, mark a gap instead of guessing.
 5. Change nothing else: keep the notes' order, wording, headings, Markdown, [Screenshot N] references and plain Unicode formulas exactly as they are.
 Return only the finished notes in Markdown."""
 }

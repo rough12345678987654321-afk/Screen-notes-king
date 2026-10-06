@@ -530,8 +530,7 @@ fun Detail(id: Long, onBack: () -> Unit) {
     val showNotesResult: (NotesResult) -> Unit = { result ->
         text = result.text
         val sourceLine = if (result.sources.isEmpty()) "" else "Sources: ${result.sources.joinToString(" → ")}"
-        notice = listOf(result.notice, gapNotice(result.text), sourceLine)
-            .filter { it.isNotBlank() }.joinToString("\n")
+        notice = listOf(result.notice, sourceLine).filter { it.isNotBlank() }.joinToString("\n")
     }
 
     val startPdfExport: () -> Unit = {
@@ -639,7 +638,7 @@ fun Detail(id: Long, onBack: () -> Unit) {
                         color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
                 val gaps = remember(text) { gapNotice(text) }
-                if (gaps.isNotBlank() && !notice.contains(AiNotesEngine.GAP_MARKER)) {
+                if (gaps.isNotBlank()) {
                     Text(gaps, style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.error)
                 }
