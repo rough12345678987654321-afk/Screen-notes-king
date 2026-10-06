@@ -14,6 +14,7 @@ import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 import android.text.StaticLayout
+import android.text.TextPaint
 import java.io.File
 
 /**
@@ -45,7 +46,9 @@ object PdfExport {
             for (b in parseBlocks(md)) pager.block(b, images)
             pager.finishPage()
             val tmp = File(ctx.cacheDir, fileName)
-            tmp.outputStream().use { doc.write(it) }
+            val out = tmp.outputStream()
+            doc.write(out)
+            out.close()
             doc.close()
             onDone(publish(ctx, tmp, fileName), null)
         } catch (e: Exception) {
@@ -56,15 +59,17 @@ object PdfExport {
     /** One A4 page at a time; blocks that do not fit flow onto the next page. */
     private class Pager(private val doc: PdfDocument) {
         var y = MARGIN
+        private var pageNo = 0
         private var page: PdfDocument.Page? = null
         private var canvas: Canvas? = null
-        private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+        private val paint = TextPaint(Paint.ANTI_ALIAS_FLAG)
         private val bgPaint = Paint()
         private val contentW = (PAGE_W - 2 * MARGIN).toInt()
 
         fun startPage() {
+            pageNo++
             page = doc.startPage(
-                PdfDocument.PageInfo.Builder(PAGE_W.toInt(), PAGE_H.toInt(), doc.pageCount + 1).create()
+                PdfDocument.PageInfo.Builder(PAGE_W.toInt(), PAGE_H.toInt(), pageNo).create()
             )
             canvas = page!!.canvas
             y = MARGIN
