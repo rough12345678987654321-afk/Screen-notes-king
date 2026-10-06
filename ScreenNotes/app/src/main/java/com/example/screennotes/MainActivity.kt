@@ -217,6 +217,7 @@ fun Home(onOpen: (Long) -> Unit) {
             }
         }
         item { AiSourcesCard(prefs) }
+        item { StudentInstructionsCard(prefs) }
         item {
             OutlinedButton(
                 enabled = !importing,
@@ -435,6 +436,53 @@ private fun AiSourcesCard(prefs: android.content.SharedPreferences) {
     }
 }
 
+@Composable
+private fun StudentInstructionsCard(prefs: android.content.SharedPreferences) {
+    var expanded by rememberSaveable { mutableStateOf(false) }
+    var instructions by remember {
+        mutableStateOf(prefs.getString(AiNotesEngine.PREF_AI_INSTRUCTIONS, "") ?: "")
+    }
+
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(
+                Modifier.fillMaxWidth().clickable { expanded = !expanded },
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    "My instructions to the AI",
+                    style = MaterialTheme.typography.titleMedium,
+                    modifier = Modifier.weight(1f)
+                )
+                Text(if (expanded) "Hide" else if (instructions.isNotBlank()) "Edit" else "Add")
+            }
+            if (expanded) {
+                Text(
+                    "Optional custom instructions appended strictly to every AI draft and merge prompt.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                OutlinedTextField(
+                    value = instructions,
+                    onValueChange = { value ->
+                        instructions = value
+                        prefs.edit().putString(AiNotesEngine.PREF_AI_INSTRUCTIONS, value).apply()
+                    },
+                    label = { Text("Instructions for AI") },
+                    placeholder = { Text("e.g. Focus deeply on derivations, write all units, keep diagrams detailed...") },
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 100.dp)
+                )
+            } else if (instructions.isNotBlank()) {
+                Text(
+                    instructions.take(80) + if (instructions.length > 80) "..." else "",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+    }
+}
+
 suspend fun deleteNote(ctx: Context, id: Long) = withContext(Dispatchers.IO) {
     val dao = AppDb.get(ctx).dao()
     File(ctx.filesDir, "shots/$id").deleteRecursively()
@@ -530,7 +578,8 @@ fun Detail(id: Long, onBack: () -> Unit) {
                         Slide(shot.ocrText, runCatching { File(shot.path).readBytes() }.getOrNull())
                     }
                     val keys = AiNotesEngine.readKeys(prefs)
-                    AiNotesEngine.makeNotes(keys, slideList, AiNotesEngine.configuredMode(prefs, keys))
+                    val instructions = prefs.getString(AiNotesEngine.PREF_AI_INSTRUCTIONS, "") ?: ""
+                    AiNotesEngine.makeNotes(keys, slideList, AiNotesEngine.configuredMode(prefs, keys), instructions)
                 }.getOrElse { error ->
                     NotesResult("AI notes failed: ${error.message ?: "Unknown error"}", succeeded = false)
                 }
@@ -551,7 +600,8 @@ fun Detail(id: Long, onBack: () -> Unit) {
                         Slide(shot.ocrText, runCatching { File(shot.path).readBytes() }.getOrNull())
                     }
                     val keys = AiNotesEngine.readKeys(prefs)
-                    AiNotesEngine.makeNotes(keys, slideList, AiNotesEngine.configuredMode(prefs, keys))
+                    val instructions = prefs.getString(AiNotesEngine.PREF_AI_INSTRUCTIONS, "") ?: ""
+                    AiNotesEngine.makeNotes(keys, slideList, AiNotesEngine.configuredMode(prefs, keys), instructions)
                 }.getOrElse { error ->
                     NotesResult("AI notes failed: ${error.message ?: "Unknown error"}", succeeded = false)
                 }

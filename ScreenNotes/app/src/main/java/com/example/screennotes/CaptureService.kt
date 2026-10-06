@@ -23,6 +23,7 @@ import java.io.File
 import java.util.concurrent.Executors
 import kotlin.math.abs
 import kotlin.math.max
+import kotlin.math.min
 
 /**
  * Looks at the screen about twice a second. When the screen has settled, it compares it with the
@@ -73,6 +74,7 @@ class CaptureService : Service() {
     private var lastFrame: IntArray? = null
     private var stableTicks = 0
     private var cur: Cur? = null
+    private var captureScale = -1f
 
     private val tick = object : Runnable {
         override fun run() {
@@ -100,7 +102,9 @@ class CaptureService : Service() {
         }, handler)
 
         val dm = resources.displayMetrics
-        val scale = 1280f / max(dm.widthPixels, dm.heightPixels)
+        val nativeMaxSide = max(dm.widthPixels, dm.heightPixels)
+        val scale = min(nativeMaxSide, 2560).toFloat() / nativeMaxSide
+        captureScale = scale
         w = (dm.widthPixels * scale).toInt()
         h = (dm.heightPixels * scale).toInt()
 
@@ -185,7 +189,10 @@ class CaptureService : Service() {
         if (chromeTop < 0) {
             val res = resources
             val dm = res.displayMetrics
-            val scale = 1280f / max(dm.widthPixels, dm.heightPixels)
+            val scale = if (captureScale > 0f) captureScale else {
+                val nativeMaxSide = max(dm.widthPixels, dm.heightPixels)
+                min(nativeMaxSide, 2560).toFloat() / nativeMaxSide
+            }
             val sb = res.getIdentifier("status_bar_height", "dimen", "android")
             val nb = res.getIdentifier("navigation_bar_height", "dimen", "android")
             chromeTop = ((if (sb > 0) res.getDimensionPixelSize(sb) else 0) * scale).toInt()
@@ -288,7 +295,7 @@ class CaptureService : Service() {
         scope.launch(worker) {
             val dir = File(filesDir, "shots/${c.noteId}").apply { mkdirs() }
             val file = File(dir, "$t.jpg")
-            file.outputStream().use { bmp.compress(Bitmap.CompressFormat.JPEG, 85, it) }
+            file.outputStream().use { bmp.compress(Bitmap.CompressFormat.JPEG, 92, it) }
             c.path = file.absolutePath
             c.id = AppDb.get(this@CaptureService).dao()
                 .insertShot(Shot(noteId = c.noteId, path = c.path, ocrText = "", timeMs = t))
@@ -305,7 +312,7 @@ class CaptureService : Service() {
         scope.launch(worker) {
             val old = File(c.path)
             val file = File(old.parentFile, "$t.jpg")
-            file.outputStream().use { bmp.compress(Bitmap.CompressFormat.JPEG, 85, it) }
+            file.outputStream().use { bmp.compress(Bitmap.CompressFormat.JPEG, 92, it) }
             c.path = file.absolutePath
             AppDb.get(this@CaptureService).dao()
                 .updateShot(Shot(id = c.id, noteId = c.noteId, path = c.path, ocrText = "", timeMs = c.timeMs))

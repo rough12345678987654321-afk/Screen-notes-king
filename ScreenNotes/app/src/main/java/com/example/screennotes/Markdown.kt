@@ -37,7 +37,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
 /** A small Markdown renderer for AI replies: headings, lists, quotes, code, bold/italic, links. */
-internal sealed class MdBlock {
+sealed class MdBlock {
     data class Heading(val level: Int, val text: String) : MdBlock()
     data class Para(val text: String) : MdBlock()
     data class Bullet(val text: String, val indent: Int, val marker: String) : MdBlock()
@@ -51,7 +51,7 @@ private val NUMBERED = Regex("""^(\d+)[.)]\s+""")
 private val HEADING = Regex("""^(#{1,6})\s+""")
 private val RULE = Regex("""^(-{3,}|\*{3,}|_{3,})$""")
 
-internal fun parseBlocks(md: String): List<MdBlock> {
+fun parseBlocks(md: String): List<MdBlock> {
     val src = md.replace("\r\n", "\n")
         .replace(Regex("<!--.*?-->", RegexOption.DOT_MATCHES_ALL), "")
         .replace(Regex("<summary>(.*?)</summary>", RegexOption.IGNORE_CASE), "**$1**")

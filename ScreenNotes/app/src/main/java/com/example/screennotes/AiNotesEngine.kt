@@ -50,6 +50,7 @@ private data class AiSource(
  */
 object AiNotesEngine {
     const val MODE_PREFERENCE = "notes_ai_mode"
+    const val PREF_AI_INSTRUCTIONS = "ai_instructions"
     private const val LEGACY_GEMINI_KEY = "key"
     private const val MAX_IMAGES = 40
     private const val IMAGE_WIDTH = 1024
@@ -167,28 +168,38 @@ object AiNotesEngine {
     fun makeNotes(
         keys: Map<AiFamily, String>,
         slides: List<Slide>,
-        mode: NotesMode
+        mode: NotesMode,
+        studentInstructions: String = ""
     ): NotesResult {
         val candidates = sources.filter { ready(it, keys) }
         if (candidates.isEmpty()) return failed("No AI sources are configured.")
 
-        if (mode == NotesMode.FAST) return fast(candidates, keys, slides)
+        fun withInstructions(basePrompt: String): String =
+            if (studentInstructions.isNotBlank()) {
+                basePrompt + "\n\nSTUDENT'S OWN INSTRUCTIONS — follow these strictly:\n" + studentInstructions.trim()
+            } else basePrompt
+
+        if (mode == NotesMode.FAST) return fast(candidates, keys, slides, withInstructions = ::withInstructions)
         if (readyFamilyCount(keys) < 2) {
-            val result = fast(candidates, keys, slides)
+            val result = fast(candidates, keys, slides, withInstructions = ::withInstructions)
             return result.copy(notice = "Top tier needs two ready AI families; used Fast instead.")
         }
 
-        val evidence = ocrEvidence(slides)
-        val draftSystem = "$NOTES_PROMPT\n\nWrite a complete first draft of the study notes. Be faithful to the evidence."
-        val first = runLadder(candidates, keys, slides, draftSystem, evidence)
+        val draftSystem = withInstructions(
+            "$NOTES_PROMPT\n\nWrite a complete first draft of the study notes. Be faithful to the evidence."
+        )
+        val first = runLadder(candidates, keys, slides, draftSystem)
         val draftOne = first.output ?: return failed(
             "Could not reach an AI source for the first draft. ${first.lastError}"
         )
 
         // Excluding the first family guarantees that the two drafts come from different providers.
+        val secondSystem = withInstructions(
+            "$NOTES_PROMPT\n\nWrite an independent complete study-notes draft. Be faithful to the evidence."
+        )
         val second = runLadder(
             candidates.filter { it.family != draftOne.source.family }, keys, slides,
-            "$NOTES_PROMPT\n\nWrite an independent complete study-notes draft. Be faithful to the evidence.", evidence
+            secondSystem
         )
         val draftTwo = second.output ?: return NotesResult(
             draftOne.text, listOf(draftOne.source.label),
@@ -197,21 +208,25 @@ object AiNotesEngine {
         )
 
         val mergeEvidence = buildString {
-            append(evidence)
+            append("OCR EVIDENCE:\n")
+            append(stitchedOcrEvidence(slides))
             append("\n\nDRAFT FROM ").append(draftOne.source.label).append(":\n")
             append(draftOne.text.take(MAX_DRAFT_CHARS))
             append("\n\nDRAFT FROM ").append(draftTwo.source.label).append(":\n")
             append(draftTwo.text.take(MAX_DRAFT_CHARS))
         }
-        val mergeSystem = "$NOTES_PROMPT\n\n" +
-            "Merge the two drafts into one accurate, coherent set of JEE study notes. Re-check every " +
-            "claim against the OCR evidence; resolve disagreements using only that evidence. Keep useful " +
-            "details from both drafts, remove unsupported claims, and return only the finished notes."
+        val mergeSystem = withInstructions(
+            "$NOTES_PROMPT\n\n" +
+                "Merge the two drafts into one accurate, coherent set of JEE study notes. Re-check every " +
+                "claim against the OCR evidence; resolve disagreements using only that evidence (on disagreement " +
+                "about edge/split content prefer the version consistent with the OCR evidence). Keep useful " +
+                "details from both drafts, remove unsupported claims, and return only the finished notes."
+        )
         // Prefer a third provider for the merge; if only two families are ready, use the best available model.
         val draftFamilies = setOf(draftOne.source.family, draftTwo.source.family)
         val mergeOrder = candidates.filter { it.family !in draftFamilies } +
             candidates.filter { it.family in draftFamilies }
-        val merged = runLadder(mergeOrder, keys, slides, mergeSystem, mergeEvidence)
+        val merged = runLadder(mergeOrder, keys, slides, mergeSystem, mergeEvidenceOverride = mergeEvidence)
         val final = merged.output
         if (final != null) {
             return NotesResult(
@@ -229,12 +244,15 @@ object AiNotesEngine {
     }
 
     private fun fast(
-        candidates: List<AiSource>, keys: Map<AiFamily, String>, slides: List<Slide>, notice: String = ""
+        candidates: List<AiSource>,
+        keys: Map<AiFamily, String>,
+        slides: List<Slide>,
+        notice: String = "",
+        withInstructions: (String) -> String
     ): NotesResult {
         val result = runLadder(
             candidates, keys, slides,
-            "$NOTES_PROMPT\n\nWrite the finished study notes from the evidence below.",
-            ocrEvidence(slides)
+            withInstructions("$NOTES_PROMPT\n\nWrite the finished study notes from the evidence below.")
         )
         val output = result.output ?: return failed(
             "All configured AI sources were unavailable. Check your connection and saved API keys, " +
@@ -252,13 +270,16 @@ object AiNotesEngine {
         keys: Map<AiFamily, String>,
         slides: List<Slide>,
         systemPrompt: String,
-        userEvidence: String
+        mergeEvidenceOverride: String? = null
     ): LadderResult {
         var lastError = "No eligible source."
         val badKeys = mutableSetOf<AiFamily>()
         for (source in candidates) {
             if (source.family in badKeys) continue
             val key = keys[source.family].orEmpty().trim()
+            val userEvidence = mergeEvidenceOverride ?: (
+                if (source.style == ApiStyle.GEMINI) geminiOcrEvidence(slides) else stitchedOcrEvidence(slides)
+            )
             val response = request(source, key, systemPrompt, userEvidence, slides)
             if (response.status in 200..299) {
                 val text = NotesClean.cleanNotes(parseReply(source, response.body)).trim()
@@ -368,7 +389,7 @@ object AiNotesEngine {
         return if (safe.isBlank()) "HTTP ${response.status}" else "HTTP ${response.status}: $safe"
     }
 
-    private fun ocrEvidence(slides: List<Slide>): String {
+    private fun geminiOcrEvidence(slides: List<Slide>): String {
         if (slides.isEmpty()) return "No captured slide text was available."
         val out = StringBuilder()
         var remaining = MAX_OCR_CHARS
@@ -382,6 +403,13 @@ object AiNotesEngine {
         }
         if (remaining <= 0) out.append("\n[Remaining OCR text omitted to fit provider context limits.]\n")
         return out.toString()
+    }
+
+    private fun stitchedOcrEvidence(slides: List<Slide>): String {
+        if (slides.isEmpty()) return "No captured slide text was available."
+        val ocrs = slides.map { it.ocr }
+        val stitched = OcrStitcher.stitchOcr(ocrs)
+        return if (stitched.isBlank()) "No captured slide text was available." else stitched.take(MAX_OCR_CHARS)
     }
 
     private fun failed(message: String) = NotesResult(
@@ -418,12 +446,15 @@ object AiNotesEngine {
         }
     }
 
+    private const val OVERLAP_RULE = "Consecutive captures overlap; lines, equations and diagrams are often CUT across two captures — reconstruct anything cut ONCE and COMPLETE using both captures, never repeat the overlapping region, never drop partial edge content; a diagram split over two captures is ONE complete diagram"
+
     private val NOTES_PROMPT = """You are an expert JEE teacher and note-taker for Physics, Chemistry and Maths.
 Write complete, clear, revision-ready Markdown notes from the supplied lecture evidence.
 - Start with a useful # topic title and a one-line explanation of why it matters for JEE.
 - Use ## sections, ### subsections, and short numbered derivation steps.
 - Explain the idea, reasoning/derivation, then formulas. Preserve every visible formula, condition, unit, reaction step and important example.
 - Describe diagrams, graphs and tables accurately. Add [Screenshot N] where a visual is important.
+- Consecutive captures overlap; lines, equations and diagrams are often CUT across two captures — reconstruct anything cut ONCE and COMPLETE using both captures, never repeat the overlapping region, never drop partial edge content; a diagram split over two captures is ONE complete diagram.
 - Do not invent facts. If OCR is unclear, say so instead of guessing.
 - FORMULAS MUST BE PLAIN TEXT WITH UNICODE, NEVER LATEX: use H₂O, x², √, →, ⇌, ΔH, α, β, ∫, Σ, ≥ and similar symbols. Do not use dollar math delimiters or backslash commands.
 - Finish with ## ⭐ Quick recap, ## ⚠️ Exam traps, and ## 📌 Likely JEE questions.
