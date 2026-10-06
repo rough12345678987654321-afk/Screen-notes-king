@@ -47,6 +47,7 @@ class CaptureService : Service() {
         const val LOST_LIMIT = 0.06f       // up to 6% of old content may change and it still counts as "same slide + more"
         const val MIN_ADDED = 2            // new content cells needed before we replace the old screenshot
         const val MIN_CONTENT_CELLS = 12   // an almost empty old screen counts as having no content
+        const val WARMUP_MS = 3000L        // ignore the first seconds after Start (player UI, file picker)
     }
 
     private class Feat(val mean: FloatArray, val energy: FloatArray)
@@ -139,12 +140,19 @@ class CaptureService : Service() {
     private fun grab() {
         if (noteId == 0L) return
         val img = reader?.acquireLatestImage() ?: return
+        // Warm-up: the first seconds usually show the file manager or player controls, not the lecture.
+        if (System.currentTimeMillis() - startMs < WARMUP_MS) {
+            img.close()
+            return
+        }
         val plane = img.planes[0]
         val rowPixels = plane.rowStride / plane.pixelStride
         val full = Bitmap.createBitmap(rowPixels, h, Bitmap.Config.ARGB_8888)
         full.copyPixelsFromBuffer(plane.buffer)
         img.close()
-        val bmp = Bitmap.createBitmap(full, 0, 0, w, h)
+        val raw = Bitmap.createBitmap(full, 0, 0, w, h)
+        val bmp = cleanFrame(raw)
+        if (bmp != raw) raw.recycle()
 
         val sig = signature(bmp)
         val prev = lastFrame
@@ -158,6 +166,8 @@ class CaptureService : Service() {
         if (stableTicks < SETTLE_TICKS) return
 
         val f = features(bmp)
+        // Black frames, empty players and other content-less screens are never worth keeping.
+        if (f.energy.count { it >= CONTENT_T } < MIN_CONTENT_CELLS) return
         val c = cur
         if (c == null) { startShot(bmp, f); return }
         when (compare(c.feat, f)) {
@@ -165,6 +175,40 @@ class CaptureService : Service() {
             1 -> replaceShot(c, bmp, f)
             else -> { }
         }
+    }
+
+    private var chromeTop = -1
+    private var chromeBottom = -1
+
+    /** Height of the status bar and navigation bar in capture pixels (they are never slide content). */
+    private fun chromeCrop(): Pair<Int, Int> {
+        if (chromeTop < 0) {
+            val res = resources
+            val dm = res.displayMetrics
+            val scale = 1280f / max(dm.widthPixels, dm.heightPixels)
+            val sb = res.getIdentifier("status_bar_height", "dimen", "android")
+            val nb = res.getIdentifier("navigation_bar_height", "dimen", "android")
+            chromeTop = ((if (sb > 0) res.getDimensionPixelSize(sb) else 0) * scale).toInt()
+            chromeBottom = ((if (nb > 0) res.getDimensionPixelSize(nb) else 0) * scale).toInt()
+        }
+        return chromeTop to chromeBottom
+    }
+
+    /** Crops away status bar, navigation bar and black letterbox rows so slides arrive clean. */
+    private fun cleanFrame(b: Bitmap): Bitmap {
+        val (top, bottom) = chromeCrop()
+        var y0 = top.coerceIn(0, b.height - 1)
+        var y1 = (b.height - bottom).coerceIn(y0 + 1, b.height)
+        fun rowDark(y: Int): Boolean {
+            var sum = 0L
+            var n = 0
+            var x = 0
+            while (x < b.width) { sum += gray(b.getPixel(x, y)); n++; x += 16 }
+            return sum / max(n, 1) < 10
+        }
+        while (y0 < y1 - 1 && rowDark(y0)) y0++
+        while (y1 > y0 + 1 && rowDark(y1 - 1)) y1--
+        return if (y0 == 0 && y1 == b.height) b else Bitmap.createBitmap(b, 0, y0, b.width, y1 - y0)
     }
 
     /** Tiny 32x18 grayscale fingerprint of the screen (used to detect motion). */
@@ -244,7 +288,7 @@ class CaptureService : Service() {
         scope.launch(worker) {
             val dir = File(filesDir, "shots/${c.noteId}").apply { mkdirs() }
             val file = File(dir, "$t.jpg")
-            file.outputStream().use { bmp.compress(Bitmap.CompressFormat.JPEG, 92, it) }
+            file.outputStream().use { bmp.compress(Bitmap.CompressFormat.JPEG, 85, it) }
             c.path = file.absolutePath
             c.id = AppDb.get(this@CaptureService).dao()
                 .insertShot(Shot(noteId = c.noteId, path = c.path, ocrText = "", timeMs = t))
@@ -261,7 +305,7 @@ class CaptureService : Service() {
         scope.launch(worker) {
             val old = File(c.path)
             val file = File(old.parentFile, "$t.jpg")
-            file.outputStream().use { bmp.compress(Bitmap.CompressFormat.JPEG, 92, it) }
+            file.outputStream().use { bmp.compress(Bitmap.CompressFormat.JPEG, 85, it) }
             c.path = file.absolutePath
             AppDb.get(this@CaptureService).dao()
                 .updateShot(Shot(id = c.id, noteId = c.noteId, path = c.path, ocrText = "", timeMs = c.timeMs))
