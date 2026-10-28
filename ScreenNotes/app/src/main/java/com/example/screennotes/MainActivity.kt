@@ -29,6 +29,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.List
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -125,6 +126,7 @@ fun App() {
     }
     BackHandler(enabled = tab == 0 && openId != null) { openId = null }
     BackHandler(enabled = tab == 1 && openRequest == null) { tab = 0 }
+    BackHandler(enabled = tab == 2) { tab = 0 }
 
     Scaffold(
         bottomBar = {
@@ -134,6 +136,10 @@ fun App() {
                     icon = { Icon(Icons.Default.Edit, contentDescription = null) }, label = { Text("Notes") },
                 )
                 NavigationBarItem(
+                    selected = tab == 2, onClick = { tab = 2 },
+                    icon = { Icon(Icons.Default.List, contentDescription = null) }, label = { Text("PDF Split") },
+                )
+                NavigationBarItem(
                     selected = tab == 1, onClick = { tab = 1 },
                     icon = { Icon(Icons.Default.Build, contentDescription = null) }, label = { Text("Updates") },
                 )
@@ -141,11 +147,13 @@ fun App() {
         }
     ) { inner ->
         Box(Modifier.padding(inner).statusBarsPadding().padding(16.dp)) {
-            if (tab == 0) {
-                val id = openId
-                if (id == null) Home { openId = it } else Detail(id) { openId = null }
-            } else {
-                UpdatesTab(openRequest) { openRequest = it }
+            when (tab) {
+                0 -> {
+                    val id = openId
+                    if (id == null) Home { openId = it } else Detail(id) { openId = null }
+                }
+                2 -> PdfSplitterTab()
+                else -> UpdatesTab(openRequest) { openRequest = it }
             }
         }
     }
